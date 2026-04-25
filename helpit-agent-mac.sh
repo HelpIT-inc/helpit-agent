@@ -12,7 +12,7 @@
 # Or: chmod +x helpit-agent-mac.sh && ./helpit-agent-mac.sh
 # ══════════════════════════════════════════════════════════════════════
 
-HELPIT_API_BASE="https://YOUR_DOMAIN"
+HELPIT_API_BASE="https://agent.helpitinc.com"
 AGENT_VERSION="1.0.0"
 POLL_INTERVAL=8
 TOKEN_DIR="$HOME/.helpit"
@@ -142,7 +142,6 @@ get_auth_token() {
         expires=$(json_get "$(cat "$TOKEN_FILE")" "['expiresAt']")
 
         if [ -n "$saved_token" ] && [ -n "$expires" ]; then
-            # Simple expiry check
             local exp_epoch
             exp_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${expires%%.*}" "+%s" 2>/dev/null || echo 0)
             local now_epoch
@@ -161,7 +160,7 @@ get_auth_token() {
     echo -e "    ${GRAY}Log in with your HelpIT account phone number.${NC}"
     echo ""
     read -rp "    Enter your phone number (e.g. +15551234567): " phone
-    phone=$(echo "$phone" | xargs)  # trim
+    phone=$(echo "$phone" | xargs)
 
     if [[ ! "$phone" == +* ]]; then
         phone="+1$phone"
@@ -295,17 +294,14 @@ create_session() {
 run_system_scan() {
     show_step "4 of 8" "Scanning your Mac"
 
-    # Update status
     call_api "PATCH" "/api/agent/session/$SESSION_ID" "$AUTH_TOKEN" '{"status":"scanning"}' > /dev/null
 
-    # Build scan data using Python for proper JSON
     local scan_json
     scan_json=$(python3 << 'PYEOF'
 import json, subprocess, os, platform, time, socket
 
 scan = {}
 
-# OS Info
 try:
     scan["os"] = {
         "name": subprocess.check_output(["sw_vers", "-productName"], text=True).strip(),
@@ -313,7 +309,6 @@ try:
         "build": subprocess.check_output(["sw_vers", "-buildVersion"], text=True).strip(),
         "architecture": platform.machine(),
     }
-    # Uptime
     boot = subprocess.check_output(["sysctl", "-n", "kern.boottime"], text=True)
     boot_sec = int(boot.split("sec = ")[1].split(",")[0])
     scan["os"]["uptime_hours"] = round((time.time() - boot_sec) / 3600, 1)
@@ -322,63 +317,43 @@ except Exception as e:
 
 print("  Scanning: OS info...", file=__import__('sys').stderr)
 
-# Hardware
 try:
     cpu = subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip()
     mem_bytes = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip())
     mem_total_gb = round(mem_bytes / (1024**3), 1)
-
     vm = subprocess.check_output(["vm_stat"], text=True)
     pages_free = int([l for l in vm.split("\n") if "Pages free" in l][0].split(":")[1].strip().rstrip("."))
     pages_inactive = int([l for l in vm.split("\n") if "Pages inactive" in l][0].split(":")[1].strip().rstrip("."))
     available_gb = round((pages_free + pages_inactive) * 4096 / (1024**3), 1)
-
     df = subprocess.check_output(["df", "-g", "/"], text=True).split("\n")[1].split()
     disk_total = int(df[1])
     disk_free = int(df[3])
-
     scan["hardware"] = {
-        "cpu": cpu,
-        "ram_total_gb": mem_total_gb,
-        "ram_available_gb": available_gb,
-        "disk_total_gb": disk_total,
-        "disk_free_gb": disk_free,
+        "cpu": cpu, "ram_total_gb": mem_total_gb, "ram_available_gb": available_gb,
+        "disk_total_gb": disk_total, "disk_free_gb": disk_free,
     }
 except Exception as e:
     scan["hardware"] = {"error": str(e)}
 
 print("  Scanning: Hardware...", file=__import__('sys').stderr)
 
-# Security
 try:
     firewall = subprocess.check_output(["/usr/libexec/ApplicationFirewall/socketfilterfw", "--getglobalstate"], text=True)
     fw_enabled = "enabled" in firewall.lower()
-
-    # Check for pending software updates
     try:
         updates = subprocess.check_output(["softwareupdate", "-l", "--no-scan"], text=True, timeout=10)
         pending = updates.count("* Label:")
     except:
         pending = -1
-
-    scan["security"] = {
-        "antivirus": "macOS XProtect (built-in)",
-        "firewall_enabled": fw_enabled,
-        "pending_updates": pending,
-    }
+    scan["security"] = {"antivirus": "macOS XProtect (built-in)", "firewall_enabled": fw_enabled, "pending_updates": pending}
 except Exception as e:
     scan["security"] = {"error": str(e)}
 
 print("  Scanning: Security...", file=__import__('sys').stderr)
 
-# Startup Programs (Launch Agents)
 try:
     launch_agents = []
-    dirs = [
-        os.path.expanduser("~/Library/LaunchAgents"),
-        "/Library/LaunchAgents",
-    ]
-    for d in dirs:
+    for d in [os.path.expanduser("~/Library/LaunchAgents"), "/Library/LaunchAgents"]:
         if os.path.isdir(d):
             for f in os.listdir(d):
                 if f.endswith(".plist"):
@@ -389,56 +364,39 @@ except:
 
 print("  Scanning: Startup programs...", file=__import__('sys').stderr)
 
-# Running Processes
 try:
     ps = subprocess.check_output(["ps", "aux"], text=True)
     lines = ps.strip().split("\n")[1:]
     scan["running_processes"] = len(lines)
-
-    # Top memory consumers
     top = subprocess.check_output(["ps", "aux", "--sort=-%mem"], text=True).split("\n")[1:11]
     top_procs = []
     for line in top:
         parts = line.split()
         if len(parts) > 10:
-            top_procs.append({
-                "name": parts[10].split("/")[-1],
-                "memory_mb": round(float(parts[3]) * mem_total_gb * 1024 / 100, 0),
-            })
+            top_procs.append({"name": parts[10].split("/")[-1], "memory_mb": round(float(parts[3]) * mem_total_gb * 1024 / 100, 0)})
     scan["top_processes"] = top_procs
 except:
     scan["running_processes"] = 0
 
 print("  Scanning: Processes...", file=__import__('sys').stderr)
 
-# Network
 try:
     dns_working = True
     try:
         socket.getaddrinfo("www.google.com", 80)
     except:
         dns_working = False
-
     dns_servers = subprocess.check_output(["scutil", "--dns"], text=True)
     dns_list = [l.split(":")[1].strip() for l in dns_servers.split("\n") if "nameserver" in l][:4]
-
-    scan["network"] = {
-        "dns_working": dns_working,
-        "dns": list(set(dns_list)),
-    }
+    scan["network"] = {"dns_working": dns_working, "dns": list(set(dns_list))}
 except:
     scan["network"] = {"dns_working": True}
 
 print("  Scanning: Network...", file=__import__('sys').stderr)
 
-# Temp/Cache files
 try:
     cache_size = 0
-    cache_dirs = [
-        os.path.expanduser("~/Library/Caches"),
-        "/tmp",
-    ]
-    for d in cache_dirs:
+    for d in [os.path.expanduser("~/Library/Caches"), "/tmp"]:
         if os.path.isdir(d):
             for root, dirs, files in os.walk(d):
                 for f in files:
@@ -452,20 +410,16 @@ except:
 
 print("  Scanning: Cache files...", file=__import__('sys').stderr)
 
-# Browser extensions
 try:
     ext_count = 0
     chrome_ext = os.path.expanduser("~/Library/Application Support/Google/Chrome/Default/Extensions")
     safari_ext = os.path.expanduser("~/Library/Safari/Extensions")
-    if os.path.isdir(chrome_ext):
-        ext_count += len(os.listdir(chrome_ext))
-    if os.path.isdir(safari_ext):
-        ext_count += len(os.listdir(safari_ext))
+    if os.path.isdir(chrome_ext): ext_count += len(os.listdir(chrome_ext))
+    if os.path.isdir(safari_ext): ext_count += len(os.listdir(safari_ext))
     scan["browser_extensions"] = ext_count
 except:
     scan["browser_extensions"] = 0
 
-# Installed apps count
 try:
     apps = os.listdir("/Applications")
     scan["installed_programs_count"] = len([a for a in apps if a.endswith(".app")])
@@ -478,7 +432,6 @@ PYEOF
 
     echo ""
     show_ok "Scan complete!"
-
     SCAN_DATA="$scan_json"
 }
 
@@ -512,7 +465,6 @@ print(json.dumps(payload))
     show_ok "Analysis complete!"
     echo ""
 
-    # Display summary
     local health summary issue_count critical_count
     health=$(json_get_safe "$ANALYSIS_RESULT" "['analysis']['overallHealth']" "unknown")
     summary=$(json_get_safe "$ANALYSIS_RESULT" "['analysis']['summary']" "Analysis complete.")
@@ -534,7 +486,6 @@ print(json.dumps(payload))
         echo -e "    ${RED}($critical_count critical)${NC}"
     fi
 
-    # Display individual issues
     python3 << PYEOF
 import json, sys
 try:
@@ -576,10 +527,8 @@ wait_for_approval() {
     echo -e "  ${CYAN}└────────────────────────────────────────────────────┘${NC}"
     echo ""
 
-    # Open browser
     open "$portal_url" 2>/dev/null || true
 
-    # Poll for approval
     local elapsed=0
     local max_wait=600
 
@@ -619,12 +568,10 @@ wait_for_approval() {
 apply_fixes() {
     show_step "7 of 8" "Fixing your Mac"
 
-    # Create Time Machine snapshot if possible
     echo -e "    ${YELLOW}Creating safety snapshot...${NC}"
     tmutil localsnapshot / 2>/dev/null && show_ok "Time Machine snapshot created." || show_status "Snapshot skipped (not critical)."
     echo ""
 
-    # Extract and execute fixes
     python3 << PYEOF
 import json, subprocess, sys, os
 
@@ -651,9 +598,7 @@ try:
 
         if command:
             try:
-                output = subprocess.run(
-                    command, shell=True, capture_output=True, text=True, timeout=120
-                )
+                output = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120)
                 if output.returncode == 0:
                     print(f"    \033[0;32m[OK]\033[0m {description} — Done")
                 else:
@@ -671,7 +616,6 @@ try:
         else:
             print(f"    \033[0;32m[OK]\033[0m Noted in report (no automated command)")
 
-        # Report result to server
         import urllib.request
         report_body = json.dumps({
             "session_token": "$SESSION_TOKEN",
@@ -682,10 +626,7 @@ try:
         req = urllib.request.Request(
             "${HELPIT_API_BASE}/api/agent/fix-result",
             data=report_body,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": "Bearer $AUTH_TOKEN"
-            },
+            headers={"Content-Type": "application/json", "Authorization": "Bearer $AUTH_TOKEN"},
             method="POST"
         )
         try:
@@ -721,11 +662,9 @@ complete_session() {
 
     sleep 15
 
-    # Clean up token
     rm -f "$TOKEN_FILE" 2>/dev/null
     rmdir "$TOKEN_DIR" 2>/dev/null
 
-    # Self-delete
     local script_path
     script_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
     (sleep 3 && rm -f "$script_path") &
@@ -739,19 +678,11 @@ complete_session() {
 main() {
     show_banner
 
-    # 1-3. Auth
     get_auth_token
-
-    # 4. Check subscription
     check_subscription
-
-    # 5. Create session
     create_session
-
-    # 6-7. Scan
     run_system_scan
 
-    # 8. Submit to AI
     if ! submit_scan_data; then
         call_api "PATCH" "/api/agent/session/$SESSION_ID" "$AUTH_TOKEN" '{"status":"failed","error_message":"AI analysis failed"}' > /dev/null
         read -rp "  Press Enter to exit"
@@ -767,15 +698,11 @@ main() {
         exit 0
     fi
 
-    # 9. Wait for approval
     if ! wait_for_approval; then
         exit 0
     fi
 
-    # 10. Apply fixes
     apply_fixes
-
-    # 11. Done
     complete_session
 }
 
