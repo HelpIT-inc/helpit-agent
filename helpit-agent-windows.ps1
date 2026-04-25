@@ -12,7 +12,7 @@
 # ══════════════════════════════════════════════════════════════════════
 
 # ── CONFIGURATION ──────────────────────────────────────────────────
-$HELPIT_API_BASE = "https://YOUR_DOMAIN"   # Your Anything.com domain
+$HELPIT_API_BASE = "https://agent.helpitinc.com"   # Your Anything.com domain
 $AGENT_VERSION = "1.0.0"
 $POLL_INTERVAL = 8  # seconds between approval checks
 $TOKEN_PATH = "$env:APPDATA\HelpIT\token.json"
