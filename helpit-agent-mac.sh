@@ -64,7 +64,7 @@ except: print('$default')
 # ══════════════════════════════════════════════════════════════════════
 
 check_auth() {
-    if [ "$AUTH_TOKEN" != '{{AUTH_TOKEN}}' ] && [ -n "$AUTH_TOKEN" ]; then
+    if [ ${#AUTH_TOKEN} -gt 10 ] && [[ "$AUTH_TOKEN" == sess_* ]]; then
         show_ok "Authenticated (pre-configured session)"
         return 0
     else
