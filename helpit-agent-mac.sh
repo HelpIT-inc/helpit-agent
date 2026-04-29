@@ -1,19 +1,17 @@
 #!/bin/bash
 # ══════════════════════════════════════════════════════════════════════
 # HELPIT AUTONOMOUS AGENT — macOS
-# Version 2.1.0
+# Version 2.2.0 — Fixed JSON parsing in apply_fixes
 # ══════════════════════════════════════════════════════════════════════
 
 HELPIT_API_BASE="https://agent.helpitinc.com"
-AGENT_VERSION="2.1.0"
+AGENT_VERSION="2.2.0"
 POLL_INTERVAL=8
 
-# ── TOKENS (replaced by server when served via /api/agent/run/) ────
 AUTH_TOKEN="{{AUTH_TOKEN}}"
 SESSION_ID="{{SESSION_ID}}"
 SESSION_TOKEN="{{SESSION_TOKEN}}"
 
-# Colors
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;37m'; NC='\033[0m'
 
@@ -48,6 +46,23 @@ call_api() {
     curl "${args[@]}" "$url" 2>/dev/null
 }
 
+# Save API response to temp file for safe parsing
+call_api_to_file() {
+    local method="$1" path="$2" body="$3" outfile="$4"
+    local url="${HELPIT_API_BASE}${path}"
+    local args=(-s -S -o "$outfile" -H "Content-Type: application/json" -H "Authorization: Bearer $AUTH_TOKEN")
+    if [ "$method" = "GET" ]; then
+        args+=(-X GET)
+    elif [ "$method" = "POST" ]; then
+        args+=(-X POST)
+        [ -n "$body" ] && args+=(-d "$body")
+    elif [ "$method" = "PATCH" ]; then
+        args+=(-X PATCH)
+        [ -n "$body" ] && args+=(-d "$body")
+    fi
+    curl "${args[@]}" "$url" 2>/dev/null
+}
+
 json_get_safe() {
     local json="$1" key="$2" default="$3"
     echo "$json" | python3 -c "
@@ -59,9 +74,18 @@ except: print('$default')
 " 2>/dev/null || echo "$default"
 }
 
-# ══════════════════════════════════════════════════════════════════════
-# STEP 1: CHECK TOKENS — skip login if pre-baked
-# ══════════════════════════════════════════════════════════════════════
+json_get_from_file() {
+    local file="$1" key="$2" default="$3"
+    python3 -c "
+import json
+try:
+    with open('$file') as f:
+        d=json.load(f)
+    val=d$key
+    print(val if val is not None else '$default')
+except: print('$default')
+" 2>/dev/null || echo "$default"
+}
 
 check_auth() {
     if [ ${#AUTH_TOKEN} -gt 10 ] && [[ "$AUTH_TOKEN" == sess_* ]]; then
@@ -76,10 +100,6 @@ check_auth() {
     fi
 }
 
-# ══════════════════════════════════════════════════════════════════════
-# STEP 2: OPEN PORTAL IN BROWSER
-# ══════════════════════════════════════════════════════════════════════
-
 open_portal() {
     local portal_url="${HELPIT_API_BASE}/helpit-agent/session/${SESSION_ID}"
     echo -e "  ${CYAN}Opening your HelpIT dashboard...${NC}"
@@ -88,10 +108,6 @@ open_portal() {
     echo ""
     open "$portal_url" 2>/dev/null || true
 }
-
-# ══════════════════════════════════════════════════════════════════════
-# STEP 3: SCAN THE MAC
-# ══════════════════════════════════════════════════════════════════════
 
 run_scan() {
     show_status "Scanning your Mac..."
@@ -227,19 +243,21 @@ PYEOF
     show_ok "Scan complete!"
 }
 
-# ══════════════════════════════════════════════════════════════════════
-# STEP 4: SUBMIT TO AI
-# ══════════════════════════════════════════════════════════════════════
-
 submit_scan() {
     show_status "Sending to AI for analysis... (15-30 seconds)"
+
+    # Save scan data to temp file to avoid quoting issues
+    local scan_file="/tmp/helpit_scan_$$.json"
+    echo "$SCAN_DATA" > "$scan_file"
 
     local body
     body=$(python3 -c "
 import json
-scan = json.loads('''$SCAN_DATA''')
+with open('$scan_file') as f:
+    scan = json.load(f)
 print(json.dumps({'session_token': '$SESSION_TOKEN', 'scan_data': scan}))
 ")
+    rm -f "$scan_file"
 
     ANALYSIS_RESULT=$(call_api "POST" "/api/agent/scan" "$body")
 
@@ -272,43 +290,43 @@ print(json.dumps({'session_token': '$SESSION_TOKEN', 'scan_data': scan}))
     return 0
 }
 
-# ══════════════════════════════════════════════════════════════════════
-# STEP 5: WAIT FOR APPROVAL
-# ══════════════════════════════════════════════════════════════════════
-
 wait_for_approval() {
     show_status "Waiting for you to approve fixes in the browser..."
     echo -e "  ${GRAY}(You can minimize this window)${NC}"
+
+    APPROVAL_FILE="/tmp/helpit_approval_$$.json"
 
     local elapsed=0 max_wait=600
     while [ $elapsed -lt $max_wait ]; do
         sleep $POLL_INTERVAL
         elapsed=$((elapsed + POLL_INTERVAL))
 
-        local session_data
-        session_data=$(call_api "GET" "/api/agent/session/$SESSION_ID")
+        # Save response to file instead of variable (avoids quoting issues)
+        call_api_to_file "GET" "/api/agent/session/$SESSION_ID" "" "$APPROVAL_FILE"
+
         local status
-        status=$(json_get_safe "$session_data" "['session']['status']" "")
+        status=$(json_get_from_file "$APPROVAL_FILE" "['session']['status']" "")
 
         if [ "$status" = "fixing" ]; then
             echo ""
             show_ok "Fixes approved! Applying now..."
-            APPROVED_FIXES="$session_data"
             return 0
         elif [ "$status" = "cancelled" ]; then
             echo ""
             show_status "Session cancelled. No changes made."
+            rm -f "$APPROVAL_FILE"
             return 1
         fi
     done
 
     echo ""
     show_fail "Timed out (10 minutes)."
+    rm -f "$APPROVAL_FILE"
     return 1
 }
 
 # ══════════════════════════════════════════════════════════════════════
-# STEP 6: APPLY FIXES
+# APPLY FIXES — Fixed: reads JSON from temp file, not inline heredoc
 # ══════════════════════════════════════════════════════════════════════
 
 apply_fixes() {
@@ -317,11 +335,14 @@ apply_fixes() {
     tmutil localsnapshot / 2>/dev/null && show_ok "Safety snapshot created." || true
     echo ""
 
+    # Use the temp file saved during approval polling
     python3 << PYEOF
-import json, subprocess, sys
+import json, subprocess, sys, urllib.request
 
 try:
-    data = json.loads('''$(echo "$APPROVED_FIXES" | sed "s/'/\\\\'/g")''')
+    with open("$APPROVAL_FILE") as f:
+        data = json.load(f)
+
     fixes = data.get("session", {}).get("fixes_approved", [])
     if not fixes:
         print("  No fixes to apply.")
@@ -334,45 +355,73 @@ try:
         command = fix_info.get("command", "")
         description = fix_info.get("description", "")
 
-        print(f"  [{i}/{total}] {title}")
+        print(f"  [{i}/{total}] \033[1;37m{title}\033[0m")
+        print(f"    Running: {description}")
+
         result = "success"
         error_details = None
 
         if command:
             try:
-                output = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120)
+                output = subprocess.run(
+                    command, shell=True, capture_output=True, text=True, timeout=120
+                )
                 if output.returncode == 0:
                     print(f"  \033[0;32m[OK]\033[0m {description}")
                 else:
                     result = "failed"
-                    error_details = output.stderr[:200] if output.stderr else "Non-zero exit"
+                    error_details = output.stderr[:200] if output.stderr else f"Exit code {output.returncode}"
                     print(f"  \033[0;31m[!!]\033[0m {error_details}")
             except subprocess.TimeoutExpired:
-                result = "failed"; error_details = "Timed out"
+                result = "failed"
+                error_details = "Command timed out after 120 seconds"
                 print(f"  \033[0;31m[!!]\033[0m Timed out")
             except Exception as e:
-                result = "failed"; error_details = str(e)
+                result = "failed"
+                error_details = str(e)
                 print(f"  \033[0;31m[!!]\033[0m {e}")
         else:
-            print(f"  \033[0;32m[OK]\033[0m Noted in report")
+            result = "success"
+            print(f"  \033[0;32m[OK]\033[0m Manual recommendation noted")
 
-        import urllib.request
-        body = json.dumps({"session_token":"$SESSION_TOKEN","fix_id":title,"result":result,"error_details":error_details}).encode()
-        req = urllib.request.Request("${HELPIT_API_BASE}/api/agent/fix-result", data=body,
-            headers={"Content-Type":"application/json","Authorization":"Bearer $AUTH_TOKEN"}, method="POST")
-        try: urllib.request.urlopen(req, timeout=10)
-        except: pass
+        # Report result to server
+        try:
+            body = json.dumps({
+                "session_token": "$SESSION_TOKEN",
+                "fix_id": title,
+                "result": result,
+                "error_details": error_details
+            }).encode()
+            req = urllib.request.Request(
+                "$HELPIT_API_BASE/api/agent/fix-result",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer $AUTH_TOKEN"
+                },
+                method="POST"
+            )
+            resp = urllib.request.urlopen(req, timeout=10)
+            resp_data = json.loads(resp.read())
+            if resp_data.get("allComplete"):
+                print(f"\n  \033[0;32m[OK] All fixes complete!\033[0m")
+        except Exception as e:
+            print(f"    Warning: Could not report result: {e}", file=sys.stderr)
+
+        print()
 
 except Exception as e:
-    print(f"  Error: {e}", file=sys.stderr)
+    print(f"  \033[0;31mError applying fixes: {e}\033[0m", file=sys.stderr)
+    import traceback
+    traceback.print_exc(file=sys.stderr)
 PYEOF
 }
 
-# ══════════════════════════════════════════════════════════════════════
-# STEP 7: CLEANUP
-# ══════════════════════════════════════════════════════════════════════
-
 cleanup() {
+    # Clean up temp files
+    rm -f "$APPROVAL_FILE" 2>/dev/null
+    rm -f /tmp/helpit_scan_$$.json 2>/dev/null
+
     echo ""
     echo -e "  ${GREEN}All done! Check your browser for the full report.${NC}"
     echo -e "  ${GRAY}This window will close in 10 seconds.${NC}"
@@ -383,23 +432,12 @@ cleanup() {
     (sleep 3 && rm -f "$script_path") &
 }
 
-# ══════════════════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════════════════
-
 main() {
     show_banner
-
-    # Check if tokens are pre-baked (skip login) or not
     check_auth
-
-    # Open portal session page in browser
     open_portal
-
-    # Scan
     run_scan
 
-    # Submit to AI
     if ! submit_scan; then
         call_api "PATCH" "/api/agent/session/$SESSION_ID" '{"status":"failed","error_message":"AI analysis failed"}' > /dev/null
         show_fail "Could not analyze. Please try again."
@@ -415,15 +453,11 @@ main() {
         exit 0
     fi
 
-    # Wait for approval on portal
     if ! wait_for_approval; then
         exit 0
     fi
 
-    # Apply fixes
     apply_fixes
-
-    # Done
     cleanup
 }
 
