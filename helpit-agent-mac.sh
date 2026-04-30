@@ -1,11 +1,11 @@
 #!/bin/bash
 # ══════════════════════════════════════════════════════════════════════
 # HELPIT AUTONOMOUS AGENT — macOS
-# Version 2.2.0 — Fixed JSON parsing in apply_fixes
+# Version 2.3.0 — Terminal auto-minimizes, customer sees only portal
 # ══════════════════════════════════════════════════════════════════════
 
 HELPIT_API_BASE="https://agent.helpitinc.com"
-AGENT_VERSION="2.2.0"
+AGENT_VERSION="2.3.0"
 POLL_INTERVAL=8
 
 AUTH_TOKEN="{{AUTH_TOKEN}}"
@@ -46,7 +46,6 @@ call_api() {
     curl "${args[@]}" "$url" 2>/dev/null
 }
 
-# Save API response to temp file for safe parsing
 call_api_to_file() {
     local method="$1" path="$2" body="$3" outfile="$4"
     local url="${HELPIT_API_BASE}${path}"
@@ -107,6 +106,10 @@ open_portal() {
     echo -e "  ${YELLOW}$portal_url${NC}"
     echo ""
     open "$portal_url" 2>/dev/null || true
+
+    # Minimize Terminal so customer only sees the portal
+    sleep 1
+    osascript -e 'tell application "Terminal" to set miniaturized of front window to true' 2>/dev/null || true
 }
 
 run_scan() {
@@ -246,7 +249,6 @@ PYEOF
 submit_scan() {
     show_status "Sending to AI for analysis... (15-30 seconds)"
 
-    # Save scan data to temp file to avoid quoting issues
     local scan_file="/tmp/helpit_scan_$$.json"
     echo "$SCAN_DATA" > "$scan_file"
 
@@ -301,7 +303,6 @@ wait_for_approval() {
         sleep $POLL_INTERVAL
         elapsed=$((elapsed + POLL_INTERVAL))
 
-        # Save response to file instead of variable (avoids quoting issues)
         call_api_to_file "GET" "/api/agent/session/$SESSION_ID" "" "$APPROVAL_FILE"
 
         local status
@@ -325,17 +326,12 @@ wait_for_approval() {
     return 1
 }
 
-# ══════════════════════════════════════════════════════════════════════
-# APPLY FIXES — Fixed: reads JSON from temp file, not inline heredoc
-# ══════════════════════════════════════════════════════════════════════
-
 apply_fixes() {
     show_status "Applying fixes..."
 
     tmutil localsnapshot / 2>/dev/null && show_ok "Safety snapshot created." || true
     echo ""
 
-    # Use the temp file saved during approval polling
     python3 << PYEOF
 import json, subprocess, sys, urllib.request
 
@@ -384,7 +380,6 @@ try:
             result = "success"
             print(f"  \033[0;32m[OK]\033[0m Manual recommendation noted")
 
-        # Report result to server
         try:
             body = json.dumps({
                 "session_token": "$SESSION_TOKEN",
@@ -418,14 +413,16 @@ PYEOF
 }
 
 cleanup() {
-    # Clean up temp files
     rm -f "$APPROVAL_FILE" 2>/dev/null
     rm -f /tmp/helpit_scan_$$.json 2>/dev/null
 
     echo ""
     echo -e "  ${GREEN}All done! Check your browser for the full report.${NC}"
-    echo -e "  ${GRAY}This window will close in 10 seconds.${NC}"
-    sleep 10
+    echo -e "  ${GRAY}This window will close in 5 seconds.${NC}"
+    sleep 5
+
+    # Close the Terminal window (not just minimize)
+    osascript -e 'tell application "Terminal" to close front window' 2>/dev/null || true
 
     local script_path
     script_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
