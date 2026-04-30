@@ -141,14 +141,47 @@ try:
     cpu = subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip()
     mem_bytes = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip())
     mem_total_gb = round(mem_bytes / (1024**3), 1)
+
+    # RAM: use vm_stat but include purgeable + cached pages as available
     vm = subprocess.check_output(["vm_stat"], text=True)
+    page_size = 4096
     pages_free = int([l for l in vm.split("\n") if "Pages free" in l][0].split(":")[1].strip().rstrip("."))
     pages_inactive = int([l for l in vm.split("\n") if "Pages inactive" in l][0].split(":")[1].strip().rstrip("."))
-    available_gb = round((pages_free + pages_inactive) * 4096 / (1024**3), 1)
-    df = subprocess.check_output(["df", "-g", "/"], text=True).split("\n")[1].split()
+    try:
+        pages_purgeable = int([l for l in vm.split("\n") if "Pages purgeable" in l][0].split(":")[1].strip().rstrip("."))
+    except:
+        pages_purgeable = 0
+    # Available = free + inactive + purgeable (cached files macOS releases instantly)
+    available_gb = round((pages_free + pages_inactive + pages_purgeable) * page_size / (1024**3), 1)
+
+    # Disk: use diskutil for accurate APFS space including purgeable
+    try:
+        diskutil_out = subprocess.check_output(["diskutil", "info", "/"], text=True)
+        # Look for "Container Free Space" or "Volume Free Space"
+        for line in diskutil_out.split("\n"):
+            if "Available Space" in line or "Container Free Space" in line or "Volume Available Capacity" in line:
+                # Extract bytes value from parentheses, e.g., "(118620000000 Bytes)"
+                import re
+                bytes_match = re.search(r'\((\d+)\s*Bytes\)', line)
+                if bytes_match:
+                    disk_free = round(int(bytes_match.group(1)) / (1024**3), 1)
+                    break
+        else:
+            # Fallback to df if diskutil doesn't show it
+            df = subprocess.check_output(["df", "-g", "/"], text=True).split("\n")[1].split()
+            disk_free = int(df[3])
+        df_line = subprocess.check_output(["df", "-g", "/"], text=True).split("\n")[1].split()
+        disk_total = int(df_line[1])
+    except:
+        df = subprocess.check_output(["df", "-g", "/"], text=True).split("\n")[1].split()
+        disk_total = int(df[1])
+        disk_free = int(df[3])
+
     scan["hardware"] = {
         "cpu": cpu, "ram_total_gb": mem_total_gb, "ram_available_gb": available_gb,
-        "disk_total_gb": int(df[1]), "disk_free_gb": int(df[3]),
+        "disk_total_gb": disk_total, "disk_free_gb": disk_free,
+        "note_disk": "APFS volume - includes purgeable space",
+        "note_ram": "Includes inactive + purgeable pages (reclaimable by macOS)",
     }
 except Exception as e:
     scan["hardware"] = {"error": str(e)}
