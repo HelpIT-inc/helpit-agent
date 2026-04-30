@@ -149,25 +149,53 @@ function Invoke-SystemScan {
             architecture = $env:PROCESSOR_ARCHITECTURE
             uptime_hours = [math]::Round($uptime.TotalHours, 1)
         }
+
+        # RAM: use Performance Counter for accurate "Available" memory
+        # This includes free + standby (cached) — the real available amount
+        $ramTotalGB = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
+        $ramAvailGB = $null
+        try {
+            $perfCounter = Get-Counter '\Memory\Available MBytes' -ErrorAction SilentlyContinue
+            if ($perfCounter) {
+                $ramAvailGB = [math]::Round($perfCounter.CounterSamples[0].CookedValue / 1024, 1)
+            }
+        } catch { }
+
+        # Fallback to WMI if Performance Counter fails
+        if (-not $ramAvailGB) {
+            $ramAvailGB = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
+        }
+
         $scanData["hardware"] = @{
             cpu              = $cpu.Name
-            ram_total_gb     = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
-            ram_available_gb = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
+            ram_total_gb     = $ramTotalGB
+            ram_available_gb = $ramAvailGB
+            note_ram         = "Includes standby/cached memory (available to apps)"
         }
     } catch {
         $scanData["os"] = @{ name = "Windows"; error = $_.Exception.Message }
     }
 
-    # Disk Space
+    # Disk Space — use Win32_LogicalDisk for accurate values
     Show-Progress "Disk space" 15
     try {
-        $drv = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Used -ne $null } | Select-Object -First 1
-        if ($drv) {
-            $total = [math]::Round(($drv.Used + $drv.Free) / 1GB, 1)
-            $free = [math]::Round($drv.Free / 1GB, 1)
+        $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction SilentlyContinue
+        if ($disk) {
+            $total = [math]::Round($disk.Size / 1GB, 1)
+            $free = [math]::Round($disk.FreeSpace / 1GB, 1)
             if (-not $scanData["hardware"]) { $scanData["hardware"] = @{} }
             $scanData["hardware"]["disk_total_gb"] = $total
             $scanData["hardware"]["disk_free_gb"] = $free
+        } else {
+            # Fallback to Get-PSDrive
+            $drv = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Used -ne $null } | Select-Object -First 1
+            if ($drv) {
+                $total = [math]::Round(($drv.Used + $drv.Free) / 1GB, 1)
+                $free = [math]::Round($drv.Free / 1GB, 1)
+                if (-not $scanData["hardware"]) { $scanData["hardware"] = @{} }
+                $scanData["hardware"]["disk_total_gb"] = $total
+                $scanData["hardware"]["disk_free_gb"] = $free
+            }
         }
     } catch { }
 
