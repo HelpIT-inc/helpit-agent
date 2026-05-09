@@ -35,7 +35,9 @@ safe_du_gb() {
 
 echo "🔍 Scanning..."
 
+# ══════════════════════════════════════════
 # 1. STORAGE
+# ══════════════════════════════════════════
 DISK_LINE=$(df -k / | tail -1)
 DISK_TOTAL_GB=$(kb_to_gb "$(echo "$DISK_LINE" | awk '{print $2}')")
 DISK_USED_GB=$(kb_to_gb "$(echo "$DISK_LINE" | awk '{print $3}')")
@@ -62,7 +64,9 @@ DOWNLOADS_GB=$(safe_du_gb "$HOME/Downloads")
 DOWNLOADS_COUNT=$(find "$HOME/Downloads" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')
 DS_STORE_COUNT=$(find "$HOME" -name ".DS_Store" -type f 2>/dev/null | wc -l | tr -d ' ')
 
+# ══════════════════════════════════════════
 # 2. MEMORY
+# ══════════════════════════════════════════
 RAM_TOTAL_GB=$(to_gb "$(sysctl -n hw.memsize 2>/dev/null || echo 0)")
 VM_STAT=$(vm_stat 2>/dev/null)
 PAGE_SIZE=$(echo "$VM_STAT" | awk '/page size of/ {print $8}'); [ -z "$PAGE_SIZE" ] && PAGE_SIZE=4096
@@ -89,7 +93,9 @@ SWAP_USED_GB=$(echo "$SWAP_RAW"  | awk -F'used = '  '{print $2}' | awk '{print $
 [ -z "$SWAP_TOTAL_GB" ] && SWAP_TOTAL_GB=0
 [ -z "$SWAP_USED_GB" ]  && SWAP_USED_GB=0
 
+# ══════════════════════════════════════════
 # 3. CPU
+# ══════════════════════════════════════════
 CPU_PERCENT=$(ps -A -o %cpu 2>/dev/null | awk '{s+=$1} END {printf "%.1f", s}')
 PROCESS_COUNT=$(ps -A 2>/dev/null | wc -l | tr -d ' ')
 TOP_CPU_JSON=$(ps -axo pid,comm,%cpu -r 2>/dev/null | head -6 | tail -5 | awk '
@@ -105,7 +111,9 @@ if [ -n "$UPTIME_SEC" ] && [ "$UPTIME_SEC" -gt 0 ]; then
   LAST_BOOT=$(date -r "$UPTIME_SEC" -u +"%Y-%m-%dT%H:%M:%SZ")
 else UPTIME_DAYS=0; LAST_BOOT="unknown"; fi
 
+# ══════════════════════════════════════════
 # 4. STARTUP
+# ══════════════════════════════════════════
 LOGIN_ITEMS_JSON=$(osascript -e 'tell application "System Events" to get the name of every login item' 2>/dev/null \
   | tr ',' '\n' | sed 's/^ *//;s/ *$//' \
   | awk 'NF>0 {gsub(/"/,"\\\""); printf "%s\"%s\"", (NR>1?",":""), $0}' \
@@ -117,4 +125,167 @@ list_dir_to_json() {
     ls -1 "$dir" 2>/dev/null | awk 'BEGIN{printf "["} NF>0{gsub(/"/,"\\\""); printf "%s\"%s\"", (NR>1?",":""), $0} END{printf "]"}'
   else echo "[]"; fi
 }
-LA
+LAUNCH_AGENTS_USER_JSON=$(list_dir_to_json "$HOME/Library/LaunchAgents")
+LAUNCH_AGENTS_SYSTEM_JSON=$(list_dir_to_json "/Library/LaunchAgents")
+LAUNCH_DAEMONS_JSON=$(list_dir_to_json "/Library/LaunchDaemons")
+UAC=$(ls "$HOME/Library/LaunchAgents" 2>/dev/null | wc -l | tr -d ' ')
+SAC=$(ls "/Library/LaunchAgents" 2>/dev/null | wc -l | tr -d ' ')
+DC=$(ls "/Library/LaunchDaemons" 2>/dev/null | wc -l | tr -d ' ')
+LIC=$(echo "$LOGIN_ITEMS_JSON" | tr ',' '\n' | wc -l | tr -d ' ')
+STARTUP_COUNT=$((UAC + SAC + DC + LIC))
+
+# ══════════════════════════════════════════
+# 5. NETWORK
+# ══════════════════════════════════════════
+DNS_SERVERS_JSON=$(scutil --dns 2>/dev/null | grep 'nameserver\[' | awk '{print $3}' | sort -u \
+  | awk 'BEGIN{printf "["} NF>0 {gsub(/"/,"\\\""); printf "%s\"%s\"", (NR>1?",":""), $0} END{printf "]"}')
+[ -z "$DNS_SERVERS_JSON" ] && DNS_SERVERS_JSON="[]"
+DNS_RESPONSE_MS=$(dig +stats google.com 2>/dev/null | awk '/Query time:/ {print $4; exit}'); [ -z "$DNS_RESPONSE_MS" ] && DNS_RESPONSE_MS=0
+PING_MS=$(ping -c 2 -t 4 8.8.8.8 2>/dev/null | awk -F'/' '/round-trip/ {printf "%.0f", $5}'); [ -z "$PING_MS" ] && PING_MS=999
+ACTIVE_INTERFACE=$(route -n get default 2>/dev/null | awk '/interface:/ {print $2}'); [ -z "$ACTIVE_INTERFACE" ] && ACTIVE_INTERFACE="unknown"
+ACTIVE_IP=$(ipconfig getifaddr "$ACTIVE_INTERFACE" 2>/dev/null); [ -z "$ACTIVE_IP" ] && ACTIVE_IP="unknown"
+DNS_CACHE_ENTRIES=$(dscacheutil -statistics 2>/dev/null | awk '/Entries/ {sum+=$2} END {print sum+0}'); [ -z "$DNS_CACHE_ENTRIES" ] && DNS_CACHE_ENTRIES=0
+WIFI_SIGNAL_DBM=0
+AIRPORT="/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport"
+if [ -x "$AIRPORT" ]; then
+  WIFI_SIGNAL_DBM=$("$AIRPORT" -I 2>/dev/null | awk '/agrCtlRSSI/ {print $2}'); [ -z "$WIFI_SIGNAL_DBM" ] && WIFI_SIGNAL_DBM=0
+fi
+
+# ══════════════════════════════════════════
+# 6. SECURITY
+# ══════════════════════════════════════════
+FILEVAULT_ENABLED=false
+fdesetup status 2>/dev/null | grep -qi "On" && FILEVAULT_ENABLED=true
+FIREWALL_STATE=$(defaults read /Library/Preferences/com.apple.alf globalstate 2>/dev/null || echo 0)
+FIREWALL_ENABLED=false; [ "$FIREWALL_STATE" != "0" ] && FIREWALL_ENABLED=true
+GATEKEEPER_ENABLED=false
+spctl --status 2>/dev/null | grep -qi "assessments enabled" && GATEKEEPER_ENABLED=true
+PENDING_UPDATES=0
+UPDATE_OUT=$(softwareupdate -l 2>&1 | head -50)
+if echo "$UPDATE_OUT" | grep -qi "No new software"; then PENDING_UPDATES=0
+else PENDING_UPDATES=$(echo "$UPDATE_OUT" | grep -c '^\* '); fi
+SIP_ENABLED=true
+csrutil status 2>/dev/null | grep -qi "disabled" && SIP_ENABLED=false
+REMOTE_LOGIN_ENABLED=false
+systemsetup -getremotelogin 2>/dev/null | grep -qi "On" && REMOTE_LOGIN_ENABLED=true
+
+# ══════════════════════════════════════════
+# 7. BROWSER
+# ══════════════════════════════════════════
+CHROME_EXT_DIR="$HOME/Library/Application Support/Google/Chrome/Default/Extensions"
+CHROME_EXT_COUNT=$(ls "$CHROME_EXT_DIR" 2>/dev/null | wc -l | tr -d ' ')
+CHROME_CACHE_GB=$(safe_du_gb "$HOME/Library/Caches/Google/Chrome")
+SAFARI_CACHE_GB=$(safe_du_gb "$HOME/Library/Caches/com.apple.Safari")
+BROWSER_HELPERS_JSON=$(ps -A -o comm 2>/dev/null \
+  | grep -Ei 'helper|extension' | sort -u | head -10 \
+  | awk 'BEGIN{printf "["} NF>0 {gsub(/"/,"\\\""); printf "%s\"%s\"", (NR>1?",":""), $0} END{printf "]"}')
+[ -z "$BROWSER_HELPERS_JSON" ] && BROWSER_HELPERS_JSON="[]"
+
+# ══════════════════════════════════════════
+# 8. SYSTEM
+# ══════════════════════════════════════════
+OS_VERSION=$(sw_vers -productVersion 2>/dev/null)
+OS_BUILD=$(sw_vers -buildVersion 2>/dev/null)
+BATTERY_HEALTH=0
+BATT_RAW=$(system_profiler SPPowerDataType 2>/dev/null)
+if echo "$BATT_RAW" | grep -q "Battery Information"; then
+  MAX_CAP=$(echo "$BATT_RAW" | awk '/Maximum Capacity/ {gsub(/%/,"",$3); print $3; exit}')
+  [ -n "$MAX_CAP" ] && BATTERY_HEALTH="$MAX_CAP"
+fi
+CRASH_REPORTS_COUNT=$(ls "$HOME/Library/Logs/DiagnosticReports" 2>/dev/null | wc -l | tr -d ' ')
+CONSOLE_ERRORS_JSON=$(log show --last 1h --predicate 'messageType == error' --style compact 2>/dev/null \
+  | head -10 | awk '{ gsub(/"/,"\\\""); if (length($0)>0) printf "%s\"%s\"", (NR>1?",":""), substr($0,1,200) }' \
+  | awk 'BEGIN{printf "["} {printf "%s",$0} END{printf "]"}')
+[ -z "$CONSOLE_ERRORS_JSON" ] && CONSOLE_ERRORS_JSON="[]"
+
+# ══════════════════════════════════════════
+# BUILD PAYLOAD & SUBMIT
+# ══════════════════════════════════════════
+PAYLOAD=$(cat <<JSON
+{
+  "session_token": "$SESSION_TOKEN",
+  "scan_data": {
+    "os_type": "mac",
+    "storage": {
+      "disk_total_gb": $DISK_TOTAL_GB,
+      "disk_used_gb": $DISK_USED_GB,
+      "disk_free_gb": $DISK_FREE_GB,
+      "disk_percent_used": $DISK_PERCENT,
+      "top_largest": $TOP_LARGEST_JSON,
+      "trash_size_gb": $TRASH_GB,
+      "ios_backups_size_gb": $IOS_BACKUPS_GB,
+      "tmp_size_gb": $TMP_GB,
+      "var_folders_size_gb": $VAR_FOLDERS_GB,
+      "ds_store_count": $DS_STORE_COUNT,
+      "downloads_size_gb": $DOWNLOADS_GB,
+      "downloads_file_count": $DOWNLOADS_COUNT
+    },
+    "memory": {
+      "ram_total_gb": $RAM_TOTAL_GB,
+      "ram_used_gb": $RAM_USED_GB,
+      "ram_available_gb": $RAM_AVAILABLE_GB,
+      "memory_pressure": "$MEM_PRESSURE",
+      "top_processes_memory": $TOP_MEM_JSON,
+      "swap_used_gb": $SWAP_USED_GB,
+      "swap_total_gb": $SWAP_TOTAL_GB
+    },
+    "cpu": {
+      "cpu_percent": $CPU_PERCENT,
+      "top_processes_cpu": $TOP_CPU_JSON,
+      "process_count": $PROCESS_COUNT,
+      "uptime_days": $UPTIME_DAYS
+    },
+    "startup": {
+      "login_items": $LOGIN_ITEMS_JSON,
+      "launch_agents_user": $LAUNCH_AGENTS_USER_JSON,
+      "launch_agents_system": $LAUNCH_AGENTS_SYSTEM_JSON,
+      "launch_daemons": $LAUNCH_DAEMONS_JSON,
+      "startup_count": $STARTUP_COUNT
+    },
+    "network": {
+      "dns_servers": $DNS_SERVERS_JSON,
+      "dns_response_ms": $DNS_RESPONSE_MS,
+      "ping_8888_ms": $PING_MS,
+      "active_interface": "$ACTIVE_INTERFACE",
+      "active_ip": "$ACTIVE_IP",
+      "dns_cache_entries": $DNS_CACHE_ENTRIES,
+      "wifi_signal_dbm": $WIFI_SIGNAL_DBM
+    },
+    "security": {
+      "filevault_enabled": $FILEVAULT_ENABLED,
+      "firewall_enabled": $FIREWALL_ENABLED,
+      "gatekeeper_enabled": $GATEKEEPER_ENABLED,
+      "pending_updates": $PENDING_UPDATES,
+      "sip_enabled": $SIP_ENABLED,
+      "remote_login_enabled": $REMOTE_LOGIN_ENABLED
+    },
+    "browser": {
+      "chrome_extension_count": $CHROME_EXT_COUNT,
+      "chrome_cache_size_gb": $CHROME_CACHE_GB,
+      "safari_cache_size_gb": $SAFARI_CACHE_GB,
+      "browser_helpers": $BROWSER_HELPERS_JSON
+    },
+    "system": {
+      "os_version": "$OS_VERSION",
+      "os_build": "$OS_BUILD",
+      "last_boot_at": "$LAST_BOOT",
+      "battery_health_percent": $BATTERY_HEALTH,
+      "crash_reports_count": $CRASH_REPORTS_COUNT,
+      "recent_console_errors": $CONSOLE_ERRORS_JSON
+    }
+  }
+}
+JSON
+)
+
+RESPONSE=$(curl -sS -X POST "$API_BASE/api/agent/scan" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $AUTH_TOKEN" \
+  --data "$PAYLOAD")
+
+if echo "$RESPONSE" | grep -q '"ok":true'; then
+  cleanup_and_exit 0
+else
+  echo "⚠️  $(echo "$RESPONSE" | head -c 300)"
+  cleanup_and_exit 1
+fi
