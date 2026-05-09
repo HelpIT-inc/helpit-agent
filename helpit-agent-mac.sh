@@ -1,5 +1,6 @@
 #!/bin/bash
 # HelpIT Autonomous Agent — macOS Comprehensive Scan (v3.0)
+# - Opens portal session page in browser automatically
 # - Minimizes Terminal on launch
 # - Submits scan_data to /api/agent/scan
 # - Closes Terminal automatically and self-deletes when done
@@ -8,11 +9,15 @@ set -u
 
 AUTH_TOKEN="{{AUTH_TOKEN}}"
 SESSION_TOKEN="{{SESSION_TOKEN}}"
+SESSION_ID="{{SESSION_ID}}"
 API_BASE="https://www.helpitinc.com"
 SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 
 # Minimize Terminal
 osascript -e 'tell application "System Events" to set visible of process "Terminal" to false' >/dev/null 2>&1 &
+
+# Open portal session page in default browser
+open "$API_BASE/helpit-agent/session/$SESSION_ID"
 
 cleanup_and_exit() {
   local code="${1:-0}"
