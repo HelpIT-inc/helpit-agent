@@ -1,494 +1,357 @@
 #!/bin/bash
-# ══════════════════════════════════════════════════════════════════════
-# HELPIT AUTONOMOUS AGENT — macOS
-# Version 2.3.0 — Terminal auto-minimizes, customer sees only portal
-# ══════════════════════════════════════════════════════════════════════
+# HelpIT Autonomous Agent — macOS Comprehensive Scan
+# Collects storage, memory, cpu, startup, network, security, browser, and system data
+# and submits it to the HelpIT backend for AI analysis.
+#
+# Placeholders are replaced server-side by /api/agent/run/[session_token]:
+#   {{AUTH_TOKEN}}    — customer session bearer token
+#   {{SESSION_ID}}    — agent session UUID
+#   {{SESSION_TOKEN}} — agent session token
 
-HELPIT_API_BASE="https://agent.helpitinc.com"
-AGENT_VERSION="2.3.0"
-POLL_INTERVAL=8
+set -u
 
 AUTH_TOKEN="{{AUTH_TOKEN}}"
-SESSION_ID="{{SESSION_ID}}"
 SESSION_TOKEN="{{SESSION_TOKEN}}"
+API_BASE="https://www.helpitinc.com"
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;37m'; NC='\033[0m'
+echo "🔍 HelpIT Autonomous Agent — Comprehensive Mac Scan"
+echo "─────────────────────────────────────────────────────"
 
-show_banner() {
-    clear
-    echo ""
-    echo -e "  ${CYAN}╔══════════════════════════════════════════════╗${NC}"
-    echo -e "  ${CYAN}║                                              ║${NC}"
-    echo -e "  ${CYAN}║         HELPIT AUTONOMOUS TECHNICIAN         ║${NC}"
-    echo -e "  ${CYAN}║                                              ║${NC}"
-    echo -e "  ${CYAN}╚══════════════════════════════════════════════╝${NC}"
-    echo ""
+# ─── helpers ───────────────────────────────────────────────────────────
+to_gb()   { awk "BEGIN { printf \"%.2f\", $1/1024/1024/1024 }"; }
+kb_to_gb(){ awk "BEGIN { printf \"%.2f\", $1/1024/1024 }"; }
+mb_to_gb(){ awk "BEGIN { printf \"%.2f\", $1/1024 }"; }
+safe_du_gb() {
+  # Returns size in GB for a path, or 0 if missing/inaccessible
+  if [ -e "$1" ]; then
+    local kb
+    kb=$(du -sk "$1" 2>/dev/null | awk '{print $1}')
+    [ -z "$kb" ] && kb=0
+    kb_to_gb "$kb"
+  else
+    echo "0"
+  fi
 }
+json_escape() { python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))' 2>/dev/null || echo "\"\""; }
 
-show_ok() { echo -e "  ${GREEN}[OK]${NC} $1"; }
-show_fail() { echo -e "  ${RED}[!!]${NC} $1"; }
-show_status() { echo -e "  ${YELLOW}$1${NC}"; }
+# ─── 1. STORAGE ────────────────────────────────────────────────────────
+echo "📦 Scanning storage..."
+DISK_LINE=$(df -k / | tail -1)
+DISK_TOTAL_KB=$(echo "$DISK_LINE" | awk '{print $2}')
+DISK_USED_KB=$(echo "$DISK_LINE" | awk '{print $3}')
+DISK_FREE_KB=$(echo "$DISK_LINE" | awk '{print $4}')
+DISK_PERCENT=$(echo "$DISK_LINE" | awk '{print $5}' | tr -d '%')
 
-call_api() {
-    local method="$1" path="$2" body="$3"
-    local url="${HELPIT_API_BASE}${path}"
-    local args=(-s -S -H "Content-Type: application/json" -H "Authorization: Bearer $AUTH_TOKEN")
-    if [ "$method" = "GET" ]; then
-        args+=(-X GET)
-    elif [ "$method" = "POST" ]; then
-        args+=(-X POST)
-        [ -n "$body" ] && args+=(-d "$body")
-    elif [ "$method" = "PATCH" ]; then
-        args+=(-X PATCH)
-        [ -n "$body" ] && args+=(-d "$body")
-    fi
-    curl "${args[@]}" "$url" 2>/dev/null
-}
+DISK_TOTAL_GB=$(kb_to_gb "$DISK_TOTAL_KB")
+DISK_USED_GB=$(kb_to_gb "$DISK_USED_KB")
+DISK_FREE_GB=$(kb_to_gb "$DISK_FREE_KB")
 
-call_api_to_file() {
-    local method="$1" path="$2" body="$3" outfile="$4"
-    local url="${HELPIT_API_BASE}${path}"
-    local args=(-s -S -o "$outfile" -H "Content-Type: application/json" -H "Authorization: Bearer $AUTH_TOKEN")
-    if [ "$method" = "GET" ]; then
-        args+=(-X GET)
-    elif [ "$method" = "POST" ]; then
-        args+=(-X POST)
-        [ -n "$body" ] && args+=(-d "$body")
-    elif [ "$method" = "PATCH" ]; then
-        args+=(-X PATCH)
-        [ -n "$body" ] && args+=(-d "$body")
-    fi
-    curl "${args[@]}" "$url" 2>/dev/null
-}
-
-json_get_safe() {
-    local json="$1" key="$2" default="$3"
-    echo "$json" | python3 -c "
-import sys,json
-try:
-    d=json.load(sys.stdin); val=d$key
-    print(val if val is not None else '$default')
-except: print('$default')
-" 2>/dev/null || echo "$default"
-}
-
-json_get_from_file() {
-    local file="$1" key="$2" default="$3"
-    python3 -c "
-import json
-try:
-    with open('$file') as f:
-        d=json.load(f)
-    val=d$key
-    print(val if val is not None else '$default')
-except: print('$default')
-" 2>/dev/null || echo "$default"
-}
-
-check_auth() {
-    if [ ${#AUTH_TOKEN} -gt 10 ] && [[ "$AUTH_TOKEN" == sess_* ]]; then
-        show_ok "Authenticated (pre-configured session)"
-        return 0
-    else
-        show_fail "This script was not configured properly."
-        echo -e "  ${GRAY}Please download a new copy from the HelpIT portal.${NC}"
-        echo -e "  ${GRAY}https://agent.helpitinc.com/helpit-agent/dashboard${NC}"
-        read -rp "  Press Enter to exit"
-        exit 1
-    fi
-}
-
-open_portal() {
-    local portal_url="${HELPIT_API_BASE}/helpit-agent/session/${SESSION_ID}"
-    echo -e "  ${CYAN}Opening your HelpIT dashboard...${NC}"
-    echo -e "  ${GRAY}View live results at:${NC}"
-    echo -e "  ${YELLOW}$portal_url${NC}"
-    echo ""
-    open "$portal_url" 2>/dev/null || true
-
-    # Minimize Terminal so customer only sees the portal
-    sleep 1
-    osascript -e 'tell application "Terminal" to set miniaturized of front window to true' 2>/dev/null || true
-}
-
-run_scan() {
-    show_status "Scanning your Mac..."
-    call_api "PATCH" "/api/agent/session/$SESSION_ID" '{"status":"scanning"}' > /dev/null
-
-    SCAN_DATA=$(python3 << 'PYEOF'
-import json, subprocess, os, platform, time, socket, sys
-
-scan = {}
-
-print("  Scanning: OS info...", file=sys.stderr)
-try:
-    scan["os"] = {
-        "name": subprocess.check_output(["sw_vers", "-productName"], text=True).strip(),
-        "version": subprocess.check_output(["sw_vers", "-productVersion"], text=True).strip(),
-        "build": subprocess.check_output(["sw_vers", "-buildVersion"], text=True).strip(),
-        "architecture": platform.machine(),
+# Top 5 largest items in $HOME (one level deep, skip Library)
+TOP_LARGEST_JSON="[]"
+if command -v du >/dev/null 2>&1; then
+  TOP=$(du -sk "$HOME"/* 2>/dev/null | sort -rn | head -5)
+  TOP_LARGEST_JSON=$(echo "$TOP" | awk '
+    BEGIN { printf "[" }
+    { gb = $1/1024/1024;
+      path = ""; for (i=2;i<=NF;i++) path = path (i==2?"":" ") $i;
+      gsub(/"/, "\\\"", path);
+      if (NR>1) printf ",";
+      printf "{\"path\":\"%s\",\"size_gb\":%.2f}", path, gb
     }
-    boot = subprocess.check_output(["sysctl", "-n", "kern.boottime"], text=True)
-    boot_sec = int(boot.split("sec = ")[1].split(",")[0])
-    scan["os"]["uptime_hours"] = round((time.time() - boot_sec) / 3600, 1)
-except Exception as e:
-    scan["os"] = {"name": "macOS", "error": str(e)}
+    END { printf "]" }
+  ')
+fi
 
-print("  Scanning: Hardware...", file=sys.stderr)
-mem_total_gb = 8
-try:
-    cpu = subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip()
-    mem_bytes = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip())
-    mem_total_gb = round(mem_bytes / (1024**3), 1)
+TRASH_GB=$(safe_du_gb "$HOME/.Trash")
+IOS_BACKUPS_GB=$(safe_du_gb "$HOME/Library/Application Support/MobileSync")
+TMP_GB=$(safe_du_gb "/tmp")
+VAR_FOLDERS_GB=$(safe_du_gb "/var/folders")
+DOWNLOADS_GB=$(safe_du_gb "$HOME/Downloads")
+DOWNLOADS_COUNT=$(find "$HOME/Downloads" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')
+DS_STORE_COUNT=$(find "$HOME" -name ".DS_Store" -type f 2>/dev/null | wc -l | tr -d ' ')
 
-    # RAM: use vm_stat but include purgeable + cached pages as available
-    vm = subprocess.check_output(["vm_stat"], text=True)
-    page_size = 4096
-    pages_free = int([l for l in vm.split("\n") if "Pages free" in l][0].split(":")[1].strip().rstrip("."))
-    pages_inactive = int([l for l in vm.split("\n") if "Pages inactive" in l][0].split(":")[1].strip().rstrip("."))
-    try:
-        pages_purgeable = int([l for l in vm.split("\n") if "Pages purgeable" in l][0].split(":")[1].strip().rstrip("."))
-    except:
-        pages_purgeable = 0
-    # Available = free + inactive + purgeable (cached files macOS releases instantly)
-    available_gb = round((pages_free + pages_inactive + pages_purgeable) * page_size / (1024**3), 1)
+# ─── 2. MEMORY ─────────────────────────────────────────────────────────
+echo "🧠 Scanning memory..."
+RAM_TOTAL_BYTES=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+RAM_TOTAL_GB=$(to_gb "$RAM_TOTAL_BYTES")
 
-    # Disk: use diskutil for accurate APFS space including purgeable
-    try:
-        diskutil_out = subprocess.check_output(["diskutil", "info", "/"], text=True)
-        # Look for "Container Free Space" or "Volume Free Space"
-        for line in diskutil_out.split("\n"):
-            if "Available Space" in line or "Container Free Space" in line or "Volume Available Capacity" in line:
-                # Extract bytes value from parentheses, e.g., "(118620000000 Bytes)"
-                import re
-                bytes_match = re.search(r'\((\d+)\s*Bytes\)', line)
-                if bytes_match:
-                    disk_free = round(int(bytes_match.group(1)) / (1024**3), 1)
-                    break
-        else:
-            # Fallback to df if diskutil doesn't show it
-            df = subprocess.check_output(["df", "-g", "/"], text=True).split("\n")[1].split()
-            disk_free = int(df[3])
-        df_line = subprocess.check_output(["df", "-g", "/"], text=True).split("\n")[1].split()
-        disk_total = int(df_line[1])
-    except:
-        df = subprocess.check_output(["df", "-g", "/"], text=True).split("\n")[1].split()
-        disk_total = int(df[1])
-        disk_free = int(df[3])
+VM_STAT=$(vm_stat 2>/dev/null)
+PAGE_SIZE=$(echo "$VM_STAT" | awk '/page size of/ {print $8}')
+[ -z "$PAGE_SIZE" ] && PAGE_SIZE=4096
+PAGES_FREE=$(echo "$VM_STAT" | awk '/Pages free/ {gsub(/\./,"",$3); print $3}')
+PAGES_INACTIVE=$(echo "$VM_STAT" | awk '/Pages inactive/ {gsub(/\./,"",$3); print $3}')
+PAGES_PURGEABLE=$(echo "$VM_STAT" | awk '/Pages purgeable/ {gsub(/\./,"",$3); print $3}')
+PAGES_ACTIVE=$(echo "$VM_STAT" | awk '/Pages active/ {gsub(/\./,"",$3); print $3}')
+PAGES_WIRED=$(echo "$VM_STAT" | awk '/Pages wired down/ {gsub(/\./,"",$4); print $4}')
+[ -z "$PAGES_FREE" ] && PAGES_FREE=0
+[ -z "$PAGES_INACTIVE" ] && PAGES_INACTIVE=0
+[ -z "$PAGES_PURGEABLE" ] && PAGES_PURGEABLE=0
+[ -z "$PAGES_ACTIVE" ] && PAGES_ACTIVE=0
+[ -z "$PAGES_WIRED" ] && PAGES_WIRED=0
 
-    scan["hardware"] = {
-        "cpu": cpu, "ram_total_gb": mem_total_gb, "ram_available_gb": available_gb,
-        "disk_total_gb": disk_total, "disk_free_gb": disk_free,
-        "note_disk": "APFS volume - includes purgeable space",
-        "note_ram": "Includes inactive + purgeable pages (reclaimable by macOS)",
+AVAIL_BYTES=$(( (PAGES_FREE + PAGES_INACTIVE + PAGES_PURGEABLE) * PAGE_SIZE ))
+USED_BYTES=$(( (PAGES_ACTIVE + PAGES_WIRED) * PAGE_SIZE ))
+RAM_AVAILABLE_GB=$(to_gb "$AVAIL_BYTES")
+RAM_USED_GB=$(to_gb "$USED_BYTES")
+
+# Memory pressure
+MEM_PRESSURE_RAW=$(memory_pressure 2>/dev/null | tail -1 || echo "")
+if echo "$MEM_PRESSURE_RAW" | grep -qi "critical"; then
+  MEM_PRESSURE="critical"
+elif echo "$MEM_PRESSURE_RAW" | grep -qi "warn"; then
+  MEM_PRESSURE="warning"
+else
+  MEM_PRESSURE="normal"
+fi
+
+# Top 5 by memory (RSS in KB → MB)
+TOP_MEM_JSON=$(ps -axo pid,comm,rss -m 2>/dev/null | head -6 | tail -5 | awk '
+  BEGIN { printf "[" }
+  { mb = $3/1024;
+    pid = $1;
+    name = ""; for (i=2;i<NF;i++) name = name (i==2?"":" ") $i;
+    gsub(/"/, "\\\"", name);
+    if (NR>1) printf ",";
+    printf "{\"pid\":%s,\"name\":\"%s\",\"memory_mb\":%.0f}", pid, name, mb
+  }
+  END { printf "]" }
+')
+
+# Swap
+SWAP_RAW=$(sysctl vm.swapusage 2>/dev/null || echo "")
+SWAP_TOTAL_GB=$(echo "$SWAP_RAW" | awk -F'total = ' '{print $2}' | awk '{print $1}' | sed 's/M//' | awk '{printf "%.2f", $1/1024}')
+SWAP_USED_GB=$(echo "$SWAP_RAW"  | awk -F'used = '  '{print $2}' | awk '{print $1}' | sed 's/M//' | awk '{printf "%.2f", $1/1024}')
+[ -z "$SWAP_TOTAL_GB" ] && SWAP_TOTAL_GB=0
+[ -z "$SWAP_USED_GB" ]  && SWAP_USED_GB=0
+
+# ─── 3. CPU ────────────────────────────────────────────────────────────
+echo "⚡ Scanning CPU..."
+CPU_PERCENT=$(ps -A -o %cpu 2>/dev/null | awk '{s+=$1} END {printf "%.1f", s}')
+PROCESS_COUNT=$(ps -A 2>/dev/null | wc -l | tr -d ' ')
+
+TOP_CPU_JSON=$(ps -axo pid,comm,%cpu -r 2>/dev/null | head -6 | tail -5 | awk '
+  BEGIN { printf "[" }
+  { pid = $1; cpu = $NF;
+    name = ""; for (i=2;i<NF;i++) name = name (i==2?"":" ") $i;
+    gsub(/"/, "\\\"", name);
+    if (NR>1) printf ",";
+    printf "{\"pid\":%s,\"name\":\"%s\",\"cpu_percent\":%.1f}", pid, name, cpu
+  }
+  END { printf "]" }
+')
+
+UPTIME_SEC=$(sysctl -n kern.boottime 2>/dev/null | awk -F'[ ,]' '{print $4}')
+NOW_SEC=$(date +%s)
+if [ -n "$UPTIME_SEC" ] && [ "$UPTIME_SEC" -gt 0 ]; then
+  UPTIME_DAYS=$(awk "BEGIN { printf \"%.1f\", ($NOW_SEC - $UPTIME_SEC)/86400 }")
+  LAST_BOOT=$(date -r "$UPTIME_SEC" -u +"%Y-%m-%dT%H:%M:%SZ")
+else
+  UPTIME_DAYS=0
+  LAST_BOOT="unknown"
+fi
+
+# ─── 4. STARTUP ────────────────────────────────────────────────────────
+echo "🚀 Scanning startup items..."
+LOGIN_ITEMS_JSON=$(osascript -e 'tell application "System Events" to get the name of every login item' 2>/dev/null \
+  | tr ',' '\n' | sed 's/^ *//;s/ *$//' | awk 'NF>0 {gsub(/"/,"\\\""); printf "%s\"%s\"", (NR>1?",":""), $0}' \
+  | awk 'BEGIN{printf "["} {printf "%s",$0} END{printf "]"}')
+[ "$LOGIN_ITEMS_JSON" = "[]" ] && LOGIN_ITEMS_JSON="[]"
+
+list_dir_to_json() {
+  local dir="$1"
+  if [ -d "$dir" ]; then
+    ls -1 "$dir" 2>/dev/null | awk 'BEGIN{printf "["} NF>0{gsub(/"/,"\\\""); printf "%s\"%s\"", (NR>1?",":""), $0} END{printf "]"}'
+  else
+    echo "[]"
+  fi
+}
+LAUNCH_AGENTS_USER_JSON=$(list_dir_to_json "$HOME/Library/LaunchAgents")
+LAUNCH_AGENTS_SYSTEM_JSON=$(list_dir_to_json "/Library/LaunchAgents")
+LAUNCH_DAEMONS_JSON=$(list_dir_to_json "/Library/LaunchDaemons")
+
+USER_AGENTS_COUNT=$(ls "$HOME/Library/LaunchAgents" 2>/dev/null | wc -l | tr -d ' ')
+SYS_AGENTS_COUNT=$(ls "/Library/LaunchAgents" 2>/dev/null | wc -l | tr -d ' ')
+DAEMONS_COUNT=$(ls "/Library/LaunchDaemons" 2>/dev/null | wc -l | tr -d ' ')
+LOGIN_ITEMS_COUNT=$(echo "$LOGIN_ITEMS_JSON" | tr ',' '\n' | wc -l | tr -d ' ')
+STARTUP_COUNT=$((USER_AGENTS_COUNT + SYS_AGENTS_COUNT + DAEMONS_COUNT + LOGIN_ITEMS_COUNT))
+
+# ─── 5. NETWORK ────────────────────────────────────────────────────────
+echo "🌐 Scanning network..."
+DNS_SERVERS_JSON=$(scutil --dns 2>/dev/null | grep 'nameserver\[' | awk '{print $3}' | sort -u \
+  | awk 'BEGIN{printf "["} NF>0 {gsub(/"/,"\\\""); printf "%s\"%s\"", (NR>1?",":""), $0} END{printf "]"}')
+[ -z "$DNS_SERVERS_JSON" ] && DNS_SERVERS_JSON="[]"
+
+DNS_RESPONSE_MS=$(dig +stats google.com 2>/dev/null | awk '/Query time:/ {print $4; exit}')
+[ -z "$DNS_RESPONSE_MS" ] && DNS_RESPONSE_MS=0
+
+PING_MS=$(ping -c 2 -t 4 8.8.8.8 2>/dev/null | awk -F'/' '/round-trip/ {printf "%.0f", $5}')
+[ -z "$PING_MS" ] && PING_MS=999
+
+ACTIVE_INTERFACE=$(route -n get default 2>/dev/null | awk '/interface:/ {print $2}')
+[ -z "$ACTIVE_INTERFACE" ] && ACTIVE_INTERFACE="unknown"
+ACTIVE_IP=$(ipconfig getifaddr "$ACTIVE_INTERFACE" 2>/dev/null)
+[ -z "$ACTIVE_IP" ] && ACTIVE_IP="unknown"
+
+DNS_CACHE_ENTRIES=$(dscacheutil -statistics 2>/dev/null | awk '/Entries/ {sum+=$2} END {print sum+0}')
+[ -z "$DNS_CACHE_ENTRIES" ] && DNS_CACHE_ENTRIES=0
+
+WIFI_SIGNAL_DBM=0
+AIRPORT="/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport"
+if [ -x "$AIRPORT" ]; then
+  WIFI_SIGNAL_DBM=$("$AIRPORT" -I 2>/dev/null | awk '/agrCtlRSSI/ {print $2}')
+  [ -z "$WIFI_SIGNAL_DBM" ] && WIFI_SIGNAL_DBM=0
+fi
+
+# ─── 6. SECURITY ───────────────────────────────────────────────────────
+echo "🔒 Scanning security settings..."
+FILEVAULT_ENABLED=false
+fdesetup status 2>/dev/null | grep -qi "On" && FILEVAULT_ENABLED=true
+
+FIREWALL_STATE=$(defaults read /Library/Preferences/com.apple.alf globalstate 2>/dev/null || echo 0)
+FIREWALL_ENABLED=false
+[ "$FIREWALL_STATE" != "0" ] && FIREWALL_ENABLED=true
+
+GATEKEEPER_ENABLED=false
+spctl --status 2>/dev/null | grep -qi "assessments enabled" && GATEKEEPER_ENABLED=true
+
+# Pending updates — non-blocking, short timeout via background
+PENDING_UPDATES=0
+UPDATE_OUT=$(softwareupdate -l 2>&1 | head -50)
+if echo "$UPDATE_OUT" | grep -qi "No new software"; then
+  PENDING_UPDATES=0
+else
+  PENDING_UPDATES=$(echo "$UPDATE_OUT" | grep -c '^\* ')
+fi
+
+SIP_ENABLED=true
+csrutil status 2>/dev/null | grep -qi "disabled" && SIP_ENABLED=false
+
+REMOTE_LOGIN_ENABLED=false
+systemsetup -getremotelogin 2>/dev/null | grep -qi "On" && REMOTE_LOGIN_ENABLED=true
+
+# ─── 7. BROWSER ────────────────────────────────────────────────────────
+echo "🌎 Scanning browsers..."
+CHROME_EXT_DIR="$HOME/Library/Application Support/Google/Chrome/Default/Extensions"
+CHROME_EXT_COUNT=$(ls "$CHROME_EXT_DIR" 2>/dev/null | wc -l | tr -d ' ')
+CHROME_CACHE_GB=$(safe_du_gb "$HOME/Library/Caches/Google/Chrome")
+SAFARI_CACHE_GB=$(safe_du_gb "$HOME/Library/Caches/com.apple.Safari")
+
+BROWSER_HELPERS_JSON=$(ps -A -o comm 2>/dev/null \
+  | grep -Ei 'helper|extension' | sort -u | head -10 \
+  | awk 'BEGIN{printf "["} NF>0 {gsub(/"/,"\\\""); printf "%s\"%s\"", (NR>1?",":""), $0} END{printf "]"}')
+[ -z "$BROWSER_HELPERS_JSON" ] && BROWSER_HELPERS_JSON="[]"
+
+# ─── 8. SYSTEM ─────────────────────────────────────────────────────────
+echo "💻 Scanning system info..."
+OS_VERSION=$(sw_vers -productVersion 2>/dev/null)
+OS_BUILD=$(sw_vers -buildVersion 2>/dev/null)
+
+BATTERY_HEALTH=0
+BATT_RAW=$(system_profiler SPPowerDataType 2>/dev/null)
+if echo "$BATT_RAW" | grep -q "Battery Information"; then
+  MAX_CAP=$(echo "$BATT_RAW" | awk '/Maximum Capacity/ {gsub(/%/,"",$3); print $3; exit}')
+  [ -n "$MAX_CAP" ] && BATTERY_HEALTH="$MAX_CAP"
+fi
+
+CRASH_REPORTS_COUNT=$(ls "$HOME/Library/Logs/DiagnosticReports" 2>/dev/null | wc -l | tr -d ' ')
+
+CONSOLE_ERRORS_JSON=$(log show --last 1h --predicate 'messageType == error' --style compact 2>/dev/null \
+  | head -10 | awk '{ gsub(/"/,"\\\""); if (length($0)>0) printf "%s\"%s\"", (NR>1?",":""), substr($0,1,200) }' \
+  | awk 'BEGIN{printf "["} {printf "%s",$0} END{printf "]"}')
+[ -z "$CONSOLE_ERRORS_JSON" ] && CONSOLE_ERRORS_JSON="[]"
+
+# ─── BUILD JSON PAYLOAD ────────────────────────────────────────────────
+echo "📤 Building scan payload..."
+PAYLOAD=$(cat <<JSON
+{
+  "session_token": "$SESSION_TOKEN",
+  "scan_data": {
+    "os_type": "mac",
+    "storage": {
+      "disk_total_gb": $DISK_TOTAL_GB,
+      "disk_used_gb": $DISK_USED_GB,
+      "disk_free_gb": $DISK_FREE_GB,
+      "disk_percent_used": $DISK_PERCENT,
+      "top_largest": $TOP_LARGEST_JSON,
+      "trash_size_gb": $TRASH_GB,
+      "ios_backups_size_gb": $IOS_BACKUPS_GB,
+      "tmp_size_gb": $TMP_GB,
+      "var_folders_size_gb": $VAR_FOLDERS_GB,
+      "ds_store_count": $DS_STORE_COUNT,
+      "downloads_size_gb": $DOWNLOADS_GB,
+      "downloads_file_count": $DOWNLOADS_COUNT
+    },
+    "memory": {
+      "ram_total_gb": $RAM_TOTAL_GB,
+      "ram_used_gb": $RAM_USED_GB,
+      "ram_available_gb": $RAM_AVAILABLE_GB,
+      "memory_pressure": "$MEM_PRESSURE",
+      "top_processes_memory": $TOP_MEM_JSON,
+      "swap_used_gb": $SWAP_USED_GB,
+      "swap_total_gb": $SWAP_TOTAL_GB
+    },
+    "cpu": {
+      "cpu_percent": $CPU_PERCENT,
+      "top_processes_cpu": $TOP_CPU_JSON,
+      "process_count": $PROCESS_COUNT,
+      "uptime_days": $UPTIME_DAYS
+    },
+    "startup": {
+      "login_items": $LOGIN_ITEMS_JSON,
+      "launch_agents_user": $LAUNCH_AGENTS_USER_JSON,
+      "launch_agents_system": $LAUNCH_AGENTS_SYSTEM_JSON,
+      "launch_daemons": $LAUNCH_DAEMONS_JSON,
+      "startup_count": $STARTUP_COUNT
+    },
+    "network": {
+      "dns_servers": $DNS_SERVERS_JSON,
+      "dns_response_ms": $DNS_RESPONSE_MS,
+      "ping_8888_ms": $PING_MS,
+      "active_interface": "$ACTIVE_INTERFACE",
+      "active_ip": "$ACTIVE_IP",
+      "dns_cache_entries": $DNS_CACHE_ENTRIES,
+      "wifi_signal_dbm": $WIFI_SIGNAL_DBM
+    },
+    "security": {
+      "filevault_enabled": $FILEVAULT_ENABLED,
+      "firewall_enabled": $FIREWALL_ENABLED,
+      "gatekeeper_enabled": $GATEKEEPER_ENABLED,
+      "pending_updates": $PENDING_UPDATES,
+      "sip_enabled": $SIP_ENABLED,
+      "remote_login_enabled": $REMOTE_LOGIN_ENABLED
+    },
+    "browser": {
+      "chrome_extension_count": $CHROME_EXT_COUNT,
+      "chrome_cache_size_gb": $CHROME_CACHE_GB,
+      "safari_cache_size_gb": $SAFARI_CACHE_GB,
+      "browser_helpers": $BROWSER_HELPERS_JSON
+    },
+    "system": {
+      "os_version": "$OS_VERSION",
+      "os_build": "$OS_BUILD",
+      "last_boot_at": "$LAST_BOOT",
+      "battery_health_percent": $BATTERY_HEALTH,
+      "crash_reports_count": $CRASH_REPORTS_COUNT,
+      "recent_console_errors": $CONSOLE_ERRORS_JSON
     }
-except Exception as e:
-    scan["hardware"] = {"error": str(e)}
-
-print("  Scanning: Security...", file=sys.stderr)
-try:
-    fw = subprocess.check_output(["/usr/libexec/ApplicationFirewall/socketfilterfw", "--getglobalstate"], text=True)
-    try:
-        updates = subprocess.check_output(["softwareupdate", "-l", "--no-scan"], text=True, timeout=10)
-        pending = updates.count("* Label:")
-    except:
-        pending = -1
-    scan["security"] = {"antivirus": "macOS XProtect", "firewall_enabled": "enabled" in fw.lower(), "pending_updates": pending}
-except Exception as e:
-    scan["security"] = {"error": str(e)}
-
-print("  Scanning: Startup programs...", file=sys.stderr)
-try:
-    agents = []
-    for d in [os.path.expanduser("~/Library/LaunchAgents"), "/Library/LaunchAgents"]:
-        if os.path.isdir(d):
-            for f in os.listdir(d):
-                if f.endswith(".plist"):
-                    agents.append({"name": f.replace(".plist",""), "enabled": True, "impact": "medium"})
-    scan["startup_programs"] = agents
-except:
-    scan["startup_programs"] = []
-
-print("  Scanning: Processes...", file=sys.stderr)
-try:
-    ps = subprocess.check_output(["ps", "aux"], text=True)
-    lines = ps.strip().split("\n")[1:]
-    scan["running_processes"] = len(lines)
-    top_procs = []
-    for line in sorted(lines, key=lambda l: float(l.split()[3]) if len(l.split()) > 3 else 0, reverse=True)[:10]:
-        parts = line.split()
-        if len(parts) > 10:
-            try:
-                top_procs.append({"name": parts[10].split("/")[-1], "memory_mb": round(float(parts[3]) * mem_total_gb * 1024 / 100, 0)})
-            except:
-                pass
-    scan["top_processes"] = top_procs
-except:
-    scan["running_processes"] = 0
-
-print("  Scanning: Network...", file=sys.stderr)
-try:
-    dns_working = True
-    try:
-        socket.getaddrinfo("www.google.com", 80)
-    except:
-        dns_working = False
-    dns_out = subprocess.check_output(["scutil", "--dns"], text=True)
-    dns_list = list(set([l.split(":")[1].strip() for l in dns_out.split("\n") if "nameserver" in l][:4]))
-    scan["network"] = {"dns_working": dns_working, "dns": dns_list}
-except:
-    scan["network"] = {"dns_working": True}
-
-print("  Scanning: Cache files...", file=sys.stderr)
-try:
-    cache_size = 0
-    for d in [os.path.expanduser("~/Library/Caches"), "/tmp"]:
-        if os.path.isdir(d):
-            for root, dirs, files in os.walk(d):
-                for f in files:
-                    try:
-                        cache_size += os.path.getsize(os.path.join(root, f))
-                    except:
-                        pass
-    scan["temp_files_gb"] = round(cache_size / (1024**3), 2)
-except:
-    scan["temp_files_gb"] = 0
-
-print("  Scanning: Apps & extensions...", file=sys.stderr)
-try:
-    ext = 0
-    for d in [os.path.expanduser("~/Library/Application Support/Google/Chrome/Default/Extensions"),
-              os.path.expanduser("~/Library/Safari/Extensions")]:
-        if os.path.isdir(d):
-            ext += len(os.listdir(d))
-    scan["browser_extensions"] = ext
-except:
-    scan["browser_extensions"] = 0
-
-try:
-    scan["installed_programs_count"] = len([a for a in os.listdir("/Applications") if a.endswith(".app")])
-except:
-    scan["installed_programs_count"] = 0
-
-print(json.dumps(scan))
-PYEOF
+  }
+}
+JSON
 )
 
-    echo ""
-    show_ok "Scan complete!"
-}
+echo "🤖 Submitting to AI for analysis..."
+RESPONSE=$(curl -sS -X POST "$API_BASE/api/agent/scan" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $AUTH_TOKEN" \
+  --data "$PAYLOAD")
 
-submit_scan() {
-    show_status "Sending to AI for analysis... (15-30 seconds)"
+if echo "$RESPONSE" | grep -q '"ok":true'; then
+  echo "✅ Scan complete! Open the dashboard to review findings."
+else
+  echo "⚠️  Scan submitted, but server returned an unexpected response:"
+  echo "$RESPONSE" | head -c 400
+fi
 
-    local scan_file="/tmp/helpit_scan_$$.json"
-    echo "$SCAN_DATA" > "$scan_file"
-
-    local body
-    body=$(python3 -c "
-import json
-with open('$scan_file') as f:
-    scan = json.load(f)
-print(json.dumps({'session_token': '$SESSION_TOKEN', 'scan_data': scan}))
-")
-    rm -f "$scan_file"
-
-    ANALYSIS_RESULT=$(call_api "POST" "/api/agent/scan" "$body")
-
-    local ok
-    ok=$(json_get_safe "$ANALYSIS_RESULT" "['ok']" "false")
-    if [ "$ok" != "True" ] && [ "$ok" != "true" ]; then
-        show_fail "AI analysis failed."
-        return 1
-    fi
-
-    show_ok "Analysis complete! Check your browser for results."
-    echo ""
-
-    local health summary issue_count
-    health=$(json_get_safe "$ANALYSIS_RESULT" "['analysis']['overallHealth']" "unknown")
-    summary=$(json_get_safe "$ANALYSIS_RESULT" "['analysis']['summary']" "")
-    issue_count=$(json_get_safe "$ANALYSIS_RESULT" "['analysis']['issueCount']" "0")
-
-    local health_color="$WHITE"
-    case "$health" in
-        good) health_color="$GREEN" ;;
-        fair) health_color="$YELLOW" ;;
-        poor|critical) health_color="$RED" ;;
-    esac
-
-    echo -e "  Health: ${health_color}$(echo "$health" | tr '[:lower:]' '[:upper:]')${NC}"
-    echo -e "  ${GRAY}$summary${NC}"
-    echo -e "  Found ${WHITE}$issue_count issue(s)${NC}"
-    echo ""
-    return 0
-}
-
-wait_for_approval() {
-    show_status "Waiting for you to approve fixes in the browser..."
-    echo -e "  ${GRAY}(You can minimize this window)${NC}"
-
-    APPROVAL_FILE="/tmp/helpit_approval_$$.json"
-
-    local elapsed=0 max_wait=600
-    while [ $elapsed -lt $max_wait ]; do
-        sleep $POLL_INTERVAL
-        elapsed=$((elapsed + POLL_INTERVAL))
-
-        call_api_to_file "GET" "/api/agent/session/$SESSION_ID" "" "$APPROVAL_FILE"
-
-        local status
-        status=$(json_get_from_file "$APPROVAL_FILE" "['session']['status']" "")
-
-        if [ "$status" = "fixing" ]; then
-            echo ""
-            show_ok "Fixes approved! Applying now..."
-            return 0
-        elif [ "$status" = "cancelled" ]; then
-            echo ""
-            show_status "Session cancelled. No changes made."
-            rm -f "$APPROVAL_FILE"
-            return 1
-        fi
-    done
-
-    echo ""
-    show_fail "Timed out (10 minutes)."
-    rm -f "$APPROVAL_FILE"
-    return 1
-}
-
-apply_fixes() {
-    show_status "Applying fixes..."
-
-    tmutil localsnapshot / 2>/dev/null && show_ok "Safety snapshot created." || true
-    echo ""
-
-    python3 << PYEOF
-import json, subprocess, sys, urllib.request
-
-try:
-    with open("$APPROVAL_FILE") as f:
-        data = json.load(f)
-
-    fixes = data.get("session", {}).get("fixes_approved", [])
-    if not fixes:
-        print("  No fixes to apply.")
-        sys.exit(0)
-
-    total = len(fixes)
-    for i, fix in enumerate(fixes, 1):
-        title = fix.get("title", "Unknown")
-        fix_info = fix.get("fix", {})
-        command = fix_info.get("command", "")
-        description = fix_info.get("description", "")
-
-        print(f"  [{i}/{total}] \033[1;37m{title}\033[0m")
-        print(f"    Running: {description}")
-
-        result = "success"
-        error_details = None
-
-        if command:
-            try:
-                output = subprocess.run(
-                    command, shell=True, capture_output=True, text=True, timeout=120
-                )
-                if output.returncode == 0:
-                    print(f"  \033[0;32m[OK]\033[0m {description}")
-                else:
-                    result = "failed"
-                    error_details = output.stderr[:200] if output.stderr else f"Exit code {output.returncode}"
-                    print(f"  \033[0;31m[!!]\033[0m {error_details}")
-            except subprocess.TimeoutExpired:
-                result = "failed"
-                error_details = "Command timed out after 120 seconds"
-                print(f"  \033[0;31m[!!]\033[0m Timed out")
-            except Exception as e:
-                result = "failed"
-                error_details = str(e)
-                print(f"  \033[0;31m[!!]\033[0m {e}")
-        else:
-            result = "success"
-            print(f"  \033[0;32m[OK]\033[0m Manual recommendation noted")
-
-        try:
-            body = json.dumps({
-                "session_token": "$SESSION_TOKEN",
-                "fix_id": title,
-                "result": result,
-                "error_details": error_details
-            }).encode()
-            req = urllib.request.Request(
-                "$HELPIT_API_BASE/api/agent/fix-result",
-                data=body,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": "Bearer $AUTH_TOKEN"
-                },
-                method="POST"
-            )
-            resp = urllib.request.urlopen(req, timeout=10)
-            resp_data = json.loads(resp.read())
-            if resp_data.get("allComplete"):
-                print(f"\n  \033[0;32m[OK] All fixes complete!\033[0m")
-        except Exception as e:
-            print(f"    Warning: Could not report result: {e}", file=sys.stderr)
-
-        print()
-
-except Exception as e:
-    print(f"  \033[0;31mError applying fixes: {e}\033[0m", file=sys.stderr)
-    import traceback
-    traceback.print_exc(file=sys.stderr)
-PYEOF
-}
-
-cleanup() {
-    rm -f "$APPROVAL_FILE" 2>/dev/null
-    rm -f /tmp/helpit_scan_$$.json 2>/dev/null
-
-    echo ""
-    echo -e "  ${GREEN}All done! Check your browser for the full report.${NC}"
-    echo -e "  ${GRAY}This window will close in 5 seconds.${NC}"
-    sleep 5
-
-    # Close the Terminal window (not just minimize)
-    osascript -e 'tell application "Terminal" to close front window' 2>/dev/null || true
-
-    local script_path
-    script_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-    (sleep 3 && rm -f "$script_path") &
-}
-
-main() {
-    show_banner
-    check_auth
-    open_portal
-    run_scan
-
-    if ! submit_scan; then
-        call_api "PATCH" "/api/agent/session/$SESSION_ID" '{"status":"failed","error_message":"AI analysis failed"}' > /dev/null
-        show_fail "Could not analyze. Please try again."
-        sleep 5
-        exit 1
-    fi
-
-    local issue_count
-    issue_count=$(json_get_safe "$ANALYSIS_RESULT" "['analysis']['issueCount']" "0")
-    if [ "$issue_count" = "0" ]; then
-        show_ok "No issues found! Your Mac is healthy."
-        cleanup
-        exit 0
-    fi
-
-    if ! wait_for_approval; then
-        exit 0
-    fi
-
-    apply_fixes
-    cleanup
-}
-
-main "$@"
+echo ""
+echo "─────────────────────────────────────────────────────"
+echo "Done. Return to your browser to review the results."
