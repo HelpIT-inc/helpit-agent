@@ -1,8 +1,11 @@
 #!/bin/bash
-# HelpIT Autonomous Agent — macOS Comprehensive Scan (v3.0)
+# HelpIT Autonomous Agent — macOS Comprehensive Scan + Fix (v3.1)
 # - Opens portal session page in browser automatically
 # - Minimizes Terminal on launch
-# - Submits scan_data to /api/agent/scan
+# - Scans 8 categories and submits to AI
+# - Waits for user approval on portal
+# - Executes approved fixes
+# - Reports fix results back to server
 # - Closes Terminal automatically and self-deletes when done
 
 set -u
@@ -204,93 +207,181 @@ CONSOLE_ERRORS_JSON=$(log show --last 1h --predicate 'messageType == error' --st
 [ -z "$CONSOLE_ERRORS_JSON" ] && CONSOLE_ERRORS_JSON="[]"
 
 # ══════════════════════════════════════════
-# BUILD PAYLOAD & SUBMIT
+# POST SCAN DATA TO AI
 # ══════════════════════════════════════════
-PAYLOAD=$(cat <<JSON
+echo "📤 Submitting scan to AI..."
+SCAN_PAYLOAD=$(cat <<JSON
 {
   "session_token": "$SESSION_TOKEN",
   "scan_data": {
     "os_type": "mac",
     "storage": {
-      "disk_total_gb": $DISK_TOTAL_GB,
-      "disk_used_gb": $DISK_USED_GB,
-      "disk_free_gb": $DISK_FREE_GB,
-      "disk_percent_used": $DISK_PERCENT,
-      "top_largest": $TOP_LARGEST_JSON,
-      "trash_size_gb": $TRASH_GB,
-      "ios_backups_size_gb": $IOS_BACKUPS_GB,
-      "tmp_size_gb": $TMP_GB,
-      "var_folders_size_gb": $VAR_FOLDERS_GB,
+      "disk_total_gb": $DISK_TOTAL_GB, "disk_used_gb": $DISK_USED_GB, "disk_free_gb": $DISK_FREE_GB,
+      "disk_percent_used": $DISK_PERCENT, "top_largest": $TOP_LARGEST_JSON,
+      "trash_size_gb": $TRASH_GB, "ios_backups_size_gb": $IOS_BACKUPS_GB,
+      "tmp_size_gb": $TMP_GB, "var_folders_size_gb": $VAR_FOLDERS_GB,
       "ds_store_count": $DS_STORE_COUNT,
-      "downloads_size_gb": $DOWNLOADS_GB,
-      "downloads_file_count": $DOWNLOADS_COUNT
+      "downloads_size_gb": $DOWNLOADS_GB, "downloads_file_count": $DOWNLOADS_COUNT
     },
     "memory": {
-      "ram_total_gb": $RAM_TOTAL_GB,
-      "ram_used_gb": $RAM_USED_GB,
-      "ram_available_gb": $RAM_AVAILABLE_GB,
-      "memory_pressure": "$MEM_PRESSURE",
-      "top_processes_memory": $TOP_MEM_JSON,
-      "swap_used_gb": $SWAP_USED_GB,
-      "swap_total_gb": $SWAP_TOTAL_GB
+      "ram_total_gb": $RAM_TOTAL_GB, "ram_used_gb": $RAM_USED_GB, "ram_available_gb": $RAM_AVAILABLE_GB,
+      "memory_pressure": "$MEM_PRESSURE", "top_processes_memory": $TOP_MEM_JSON,
+      "swap_used_gb": $SWAP_USED_GB, "swap_total_gb": $SWAP_TOTAL_GB
     },
     "cpu": {
-      "cpu_percent": $CPU_PERCENT,
-      "top_processes_cpu": $TOP_CPU_JSON,
-      "process_count": $PROCESS_COUNT,
-      "uptime_days": $UPTIME_DAYS
+      "cpu_percent": $CPU_PERCENT, "top_processes_cpu": $TOP_CPU_JSON,
+      "process_count": $PROCESS_COUNT, "uptime_days": $UPTIME_DAYS
     },
     "startup": {
-      "login_items": $LOGIN_ITEMS_JSON,
-      "launch_agents_user": $LAUNCH_AGENTS_USER_JSON,
-      "launch_agents_system": $LAUNCH_AGENTS_SYSTEM_JSON,
-      "launch_daemons": $LAUNCH_DAEMONS_JSON,
+      "login_items": $LOGIN_ITEMS_JSON, "launch_agents_user": $LAUNCH_AGENTS_USER_JSON,
+      "launch_agents_system": $LAUNCH_AGENTS_SYSTEM_JSON, "launch_daemons": $LAUNCH_DAEMONS_JSON,
       "startup_count": $STARTUP_COUNT
     },
     "network": {
-      "dns_servers": $DNS_SERVERS_JSON,
-      "dns_response_ms": $DNS_RESPONSE_MS,
-      "ping_8888_ms": $PING_MS,
-      "active_interface": "$ACTIVE_INTERFACE",
-      "active_ip": "$ACTIVE_IP",
-      "dns_cache_entries": $DNS_CACHE_ENTRIES,
-      "wifi_signal_dbm": $WIFI_SIGNAL_DBM
+      "dns_servers": $DNS_SERVERS_JSON, "dns_response_ms": $DNS_RESPONSE_MS,
+      "ping_8888_ms": $PING_MS, "active_interface": "$ACTIVE_INTERFACE", "active_ip": "$ACTIVE_IP",
+      "dns_cache_entries": $DNS_CACHE_ENTRIES, "wifi_signal_dbm": $WIFI_SIGNAL_DBM
     },
     "security": {
-      "filevault_enabled": $FILEVAULT_ENABLED,
-      "firewall_enabled": $FIREWALL_ENABLED,
-      "gatekeeper_enabled": $GATEKEEPER_ENABLED,
-      "pending_updates": $PENDING_UPDATES,
-      "sip_enabled": $SIP_ENABLED,
-      "remote_login_enabled": $REMOTE_LOGIN_ENABLED
+      "filevault_enabled": $FILEVAULT_ENABLED, "firewall_enabled": $FIREWALL_ENABLED,
+      "gatekeeper_enabled": $GATEKEEPER_ENABLED, "pending_updates": $PENDING_UPDATES,
+      "sip_enabled": $SIP_ENABLED, "remote_login_enabled": $REMOTE_LOGIN_ENABLED
     },
     "browser": {
-      "chrome_extension_count": $CHROME_EXT_COUNT,
-      "chrome_cache_size_gb": $CHROME_CACHE_GB,
-      "safari_cache_size_gb": $SAFARI_CACHE_GB,
-      "browser_helpers": $BROWSER_HELPERS_JSON
+      "chrome_extension_count": $CHROME_EXT_COUNT, "chrome_cache_size_gb": $CHROME_CACHE_GB,
+      "safari_cache_size_gb": $SAFARI_CACHE_GB, "browser_helpers": $BROWSER_HELPERS_JSON
     },
     "system": {
-      "os_version": "$OS_VERSION",
-      "os_build": "$OS_BUILD",
-      "last_boot_at": "$LAST_BOOT",
-      "battery_health_percent": $BATTERY_HEALTH,
-      "crash_reports_count": $CRASH_REPORTS_COUNT,
-      "recent_console_errors": $CONSOLE_ERRORS_JSON
+      "os_version": "$OS_VERSION", "os_build": "$OS_BUILD",
+      "last_boot_at": "$LAST_BOOT", "battery_health_percent": $BATTERY_HEALTH,
+      "crash_reports_count": $CRASH_REPORTS_COUNT, "recent_console_errors": $CONSOLE_ERRORS_JSON
     }
   }
 }
 JSON
 )
 
-RESPONSE=$(curl -sS -X POST "$API_BASE/api/agent/scan" \
+SCAN_RESPONSE=$(curl -sS -X POST "$API_BASE/api/agent/scan" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $AUTH_TOKEN" \
-  --data "$PAYLOAD")
+  --max-time 180 \
+  --data "$SCAN_PAYLOAD")
 
-if echo "$RESPONSE" | grep -q '"ok":true'; then
-  cleanup_and_exit 0
-else
-  echo "⚠️  $(echo "$RESPONSE" | head -c 300)"
+if ! echo "$SCAN_RESPONSE" | grep -q '"ok":true'; then
+  echo "⚠️  Scan failed: $(echo "$SCAN_RESPONSE" | head -c 300)"
   cleanup_and_exit 1
 fi
+
+echo "✅ Scan submitted. Waiting for approval on portal..."
+
+# ══════════════════════════════════════════
+# POLL FOR APPROVAL — wait for user to
+# approve fixes on the portal
+# ══════════════════════════════════════════
+MAX_WAIT=600  # 10 minutes max wait for approval
+POLL_INTERVAL=5
+WAITED=0
+
+while [ "$WAITED" -lt "$MAX_WAIT" ]; do
+  SESSION_RESPONSE=$(curl -sS -X GET "$API_BASE/api/agent/session/$SESSION_ID" \
+    -H "Authorization: Bearer $AUTH_TOKEN" \
+    --max-time 15 2>/dev/null)
+
+  STATUS=$(echo "$SESSION_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('session',{}).get('status',''))" 2>/dev/null)
+
+  case "$STATUS" in
+    fixing)
+      echo "🔧 Fixes approved! Executing..."
+      break
+      ;;
+    completed)
+      echo "✅ Session completed."
+      cleanup_and_exit 0
+      ;;
+    cancelled|failed)
+      echo "❌ Session $STATUS."
+      cleanup_and_exit 0
+      ;;
+    awaiting_approval)
+      # Still waiting for user to approve on portal
+      ;;
+    *)
+      # scanning, analyzing, or other transitional state
+      ;;
+  esac
+
+  sleep "$POLL_INTERVAL"
+  WAITED=$((WAITED + POLL_INTERVAL))
+done
+
+if [ "$WAITED" -ge "$MAX_WAIT" ]; then
+  echo "⏰ Timed out waiting for approval."
+  cleanup_and_exit 1
+fi
+
+# ══════════════════════════════════════════
+# EXECUTE APPROVED FIXES
+# ══════════════════════════════════════════
+# Get the approved fixes from the session
+FIXES_JSON=$(echo "$SESSION_RESPONSE" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+fixes = d.get('session', {}).get('fixes_approved', [])
+print(json.dumps(fixes))
+" 2>/dev/null)
+
+if [ -z "$FIXES_JSON" ] || [ "$FIXES_JSON" = "[]" ] || [ "$FIXES_JSON" = "null" ]; then
+  echo "⚠️  No fixes to execute."
+  cleanup_and_exit 0
+fi
+
+# Parse and execute each fix
+FIX_COUNT=$(echo "$FIXES_JSON" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null)
+echo "🔧 Executing $FIX_COUNT fixes..."
+
+for i in $(seq 0 $((FIX_COUNT - 1))); do
+  FIX_TITLE=$(echo "$FIXES_JSON" | python3 -c "import sys,json; f=json.load(sys.stdin)[$i]; print(f.get('title',''))" 2>/dev/null)
+  FIX_CMD=$(echo "$FIXES_JSON" | python3 -c "import sys,json; f=json.load(sys.stdin)[$i]; print(f.get('fix',{}).get('command',''))" 2>/dev/null)
+  FIX_ID=$(echo "$FIXES_JSON" | python3 -c "import sys,json; f=json.load(sys.stdin)[$i]; print(f.get('id', f.get('title','')))" 2>/dev/null)
+
+  if [ -z "$FIX_CMD" ] || [ "$FIX_CMD" = "None" ] || [ "$FIX_CMD" = "null" ]; then
+    echo "  ⏭️  Skipping '$FIX_TITLE' — no command"
+    # Report as skipped
+    curl -sS -X POST "$API_BASE/api/agent/fix-result" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $AUTH_TOKEN" \
+      --max-time 10 \
+      --data "{\"session_token\":\"$SESSION_TOKEN\",\"fix_id\":\"$FIX_TITLE\",\"result\":\"failed\",\"error_details\":\"No executable command provided\"}" >/dev/null 2>&1
+    continue
+  fi
+
+  echo "  🔧 Fixing: $FIX_TITLE"
+
+  # Execute the fix command
+  FIX_OUTPUT=$(eval "$FIX_CMD" 2>&1)
+  FIX_EXIT=$?
+
+  if [ "$FIX_EXIT" -eq 0 ]; then
+    FIX_RESULT="success"
+    echo "  ✅ Fixed: $FIX_TITLE"
+  else
+    FIX_RESULT="failed"
+    echo "  ❌ Failed: $FIX_TITLE"
+  fi
+
+  # Escape the output for JSON
+  ESCAPED_OUTPUT=$(echo "$FIX_OUTPUT" | head -c 500 | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))' 2>/dev/null || echo '""')
+
+  # Report result back to server
+  curl -sS -X POST "$API_BASE/api/agent/fix-result" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $AUTH_TOKEN" \
+    --max-time 10 \
+    --data "{\"session_token\":\"$SESSION_TOKEN\",\"fix_id\":\"$FIX_TITLE\",\"result\":\"$FIX_RESULT\",\"error_details\":$ESCAPED_OUTPUT}" >/dev/null 2>&1
+
+  # Small delay between fixes
+  sleep 1
+done
+
+echo "✅ All fixes complete!"
+cleanup_and_exit 0
