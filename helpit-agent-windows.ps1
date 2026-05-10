@@ -1,7 +1,10 @@
-# HelpIT Autonomous Agent — Windows Comprehensive Scan (v3.0)
+# HelpIT Autonomous Agent — Windows Comprehensive Scan + Fix (v3.1)
 # - Opens portal session page in browser automatically
 # - Minimizes PowerShell window on launch
-# - Submits scan_data to /api/agent/scan
+# - Scans 8 categories and submits to AI
+# - Waits for user approval on portal
+# - Executes approved fixes
+# - Reports fix results back to server
 # - Closes PowerShell automatically and self-deletes when done
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -283,8 +286,10 @@ try {
 } catch {}
 
 # ══════════════════════════════════════════
-# BUILD PAYLOAD & SUBMIT
+# POST SCAN DATA TO AI
 # ══════════════════════════════════════════
+Write-Host "📤 Submitting scan to AI..."
+
 $scanData = [ordered]@{
   os_type = "windows"
   storage = [ordered]@{
@@ -353,25 +358,156 @@ $scanData = [ordered]@{
   }
 }
 
-$payload = @{
+$scanPayload = @{
   session_token = $SessionToken
   scan_data     = $scanData
 } | ConvertTo-Json -Depth 8 -Compress
 
 try {
-  $resp = Invoke-RestMethod -Uri "$ApiBase/api/agent/scan" `
+  $scanResp = Invoke-RestMethod -Uri "$ApiBase/api/agent/scan" `
     -Method Post `
     -ContentType 'application/json' `
     -Headers @{ Authorization = "Bearer $AuthToken" } `
-    -Body $payload `
+    -Body $scanPayload `
     -TimeoutSec 180
-  if ($resp.ok) {
-    Cleanup-And-Exit 0
-  } else {
-    Write-Host "⚠️  $($resp | ConvertTo-Json -Depth 4)"
+  if (-not $scanResp.ok) {
+    Write-Host "⚠️  Scan failed: $($scanResp | ConvertTo-Json -Depth 4)"
     Cleanup-And-Exit 1
   }
 } catch {
-  Write-Host "❌ $($_.Exception.Message)"
+  Write-Host "❌ Scan failed: $($_.Exception.Message)"
   Cleanup-And-Exit 1
 }
+
+Write-Host "✅ Scan submitted. Waiting for approval on portal..."
+
+# ══════════════════════════════════════════
+# POLL FOR APPROVAL — wait for user to
+# approve fixes on the portal
+# ══════════════════════════════════════════
+$maxWait = 600  # 10 minutes
+$pollInterval = 5
+$waited = 0
+$sessionResponse = $null
+
+while ($waited -lt $maxWait) {
+  try {
+    $sessionResponse = Invoke-RestMethod -Uri "$ApiBase/api/agent/session/$SessionId" `
+      -Method Get `
+      -Headers @{ Authorization = "Bearer $AuthToken" } `
+      -TimeoutSec 15
+  } catch {
+    # Retry on failure
+    Start-Sleep -Seconds $pollInterval
+    $waited += $pollInterval
+    continue
+  }
+
+  $status = $sessionResponse.session.status
+
+  switch ($status) {
+    "fixing" {
+      Write-Host "🔧 Fixes approved! Executing..."
+      break
+    }
+    "completed" {
+      Write-Host "✅ Session completed."
+      Cleanup-And-Exit 0
+    }
+    { $_ -in @("cancelled", "failed") } {
+      Write-Host "❌ Session $_."
+      Cleanup-And-Exit 0
+    }
+    default {
+      # awaiting_approval, scanning, analyzing — keep waiting
+    }
+  }
+
+  if ($status -eq "fixing") { break }
+
+  Start-Sleep -Seconds $pollInterval
+  $waited += $pollInterval
+}
+
+if ($waited -ge $maxWait) {
+  Write-Host "⏰ Timed out waiting for approval."
+  Cleanup-And-Exit 1
+}
+
+# ══════════════════════════════════════════
+# EXECUTE APPROVED FIXES
+# ══════════════════════════════════════════
+$fixesApproved = $sessionResponse.session.fixes_approved
+
+if (-not $fixesApproved -or $fixesApproved.Count -eq 0) {
+  Write-Host "⚠️  No fixes to execute."
+  Cleanup-And-Exit 0
+}
+
+$fixCount = $fixesApproved.Count
+Write-Host "🔧 Executing $fixCount fixes..."
+
+foreach ($fix in $fixesApproved) {
+  $fixTitle = $fix.title
+  $fixCmd   = $fix.fix.command
+  $fixId    = if ($fix.id) { $fix.id } else { $fix.title }
+
+  if (-not $fixCmd -or $fixCmd -eq "null") {
+    Write-Host "  ⏭️  Skipping '$fixTitle' — no command"
+    try {
+      $skipBody = @{
+        session_token = $SessionToken
+        fix_id        = $fixTitle
+        result        = "failed"
+        error_details = "No executable command provided"
+      } | ConvertTo-Json -Compress
+      $null = Invoke-RestMethod -Uri "$ApiBase/api/agent/fix-result" `
+        -Method Post -ContentType 'application/json' `
+        -Headers @{ Authorization = "Bearer $AuthToken" } `
+        -Body $skipBody -TimeoutSec 10
+    } catch {}
+    continue
+  }
+
+  Write-Host "  🔧 Fixing: $fixTitle"
+
+  # Execute the fix command
+  $fixResult = "success"
+  $fixError  = ""
+  try {
+    $output = Invoke-Expression $fixCmd 2>&1 | Out-String
+    if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
+      $fixResult = "failed"
+      $fixError  = $output.Substring(0, [Math]::Min(500, $output.Length))
+    }
+  } catch {
+    $fixResult = "failed"
+    $fixError  = $_.Exception.Message.Substring(0, [Math]::Min(500, $_.Exception.Message.Length))
+  }
+
+  if ($fixResult -eq "success") {
+    Write-Host "  ✅ Fixed: $fixTitle"
+  } else {
+    Write-Host "  ❌ Failed: $fixTitle"
+  }
+
+  # Report result back to server
+  try {
+    $resultBody = @{
+      session_token = $SessionToken
+      fix_id        = $fixTitle
+      result        = $fixResult
+      error_details = $fixError
+    } | ConvertTo-Json -Compress
+    $null = Invoke-RestMethod -Uri "$ApiBase/api/agent/fix-result" `
+      -Method Post -ContentType 'application/json' `
+      -Headers @{ Authorization = "Bearer $AuthToken" } `
+      -Body $resultBody -TimeoutSec 10
+  } catch {}
+
+  # Small delay between fixes
+  Start-Sleep -Seconds 1
+}
+
+Write-Host "✅ All fixes complete!"
+Cleanup-And-Exit 0
