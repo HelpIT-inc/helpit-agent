@@ -1,40 +1,27 @@
-# HelpIT Autonomous Agent — Windows Comprehensive Scan + Fix (v4.0)
-# Built on v3.1 — IDENTICAL backend contract (endpoints, payload shapes, auth, polling,
-# fix-result). New in v4: hardware/OEM identity, storage media type + drive health,
-# Windows Update cache + pending-reboot, Defender definition age, and a client-side
-# safety allowlist that blocks any non-approved command shape before execution.
-# Also fixes the unterminated final Write-Host string from v3.1.
+# HelpIT Autonomous Agent — Windows Scan + Fix (v5.0)
+# v5 security rewrite: the agent NEVER executes a command string from the server.
+#   - Auth: every fix-phase call uses ONLY the short-lived agt_ SessionToken.
+#   - Approval: polls /approved-actions, which returns nothing until the customer
+#     approves in the portal (the human gate, enforced server-side).
+#   - Execution: approved {action_id, params} are mapped to fixed cmdlet calls
+#     via a dispatch switch. No Invoke-Expression. No allowlist-on-strings.
+# The SCAN section (0-8 + scan POST) is UNCHANGED from v4.
 
 $ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference    = 'SilentlyContinue'
 
+# AuthToken is intentionally blanked by the server now (token hygiene). The agent
+# authenticates every call with the agt_ SessionToken only. The line is kept so
+# the scan POST below still references a defined variable.
 $AuthToken    = "{{AUTH_TOKEN}}"
 $SessionToken = "{{SESSION_TOKEN}}"
 $SessionId    = "{{SESSION_ID}}"
 $ApiBase      = "https://www.helpitinc.com"
-$ScriptPath   = $MyInvocation.MyCommand.Path
 
-# Minimize the console window
-try {
-  Add-Type -Name Win -Namespace Native -MemberDefinition @"
-    [System.Runtime.InteropServices.DllImport("user32.dll")]
-    public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
-    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
-    public static extern System.IntPtr GetConsoleWindow();
-"@
-  $hWnd = [Native.Win]::GetConsoleWindow()
-  if ($hWnd -ne [System.IntPtr]::Zero) { [void][Native.Win]::ShowWindow($hWnd, 6) }
-} catch {}
-
-# Open portal session page in default browser
+# Open portal session page in default browser so the customer can review & approve
 Start-Process "$ApiBase/helpit-agent/session/$SessionId"
 
-function Cleanup-And-Exit([int]$Code = 0) {
-  if ($ScriptPath -and (Test-Path $ScriptPath)) {
-    Remove-Item -Path $ScriptPath -Force -ErrorAction SilentlyContinue
-  }
-  exit $Code
-}
+function Cleanup-And-Exit([int]$Code = 0) { exit $Code }
 
 function Get-FolderSizeGB([string]$Path) {
   if (-not (Test-Path $Path)) { return 0 }
@@ -46,32 +33,10 @@ function Get-FolderSizeGB([string]$Path) {
   } catch { return 0 }
 }
 
-# ── NEW (v4): client-side safety allowlist ──────────────────────────────────
-# Defense-in-depth. Even if the server returns a command, we refuse to run it
-# unless it matches a known-safe shape AND contains no elevation/destructive tokens.
-function Test-SafeCommand([string]$c) {
-  if ([string]::IsNullOrWhiteSpace($c)) { return $false }
-  $deny = @('Format-Volume','Format ','reg delete','reg.exe delete','bcdedit','diskpart',
-            'Stop-Computer','Restart-Computer','shutdown','net user','sc delete','sc.exe delete',
-            'Remove-Item -Path "C:\','rmdir /s','del /f','Set-MpPreference -Disable')
-  foreach ($d in $deny) { if ($c -match [regex]::Escape($d)) { return $false } }
-  $allow = @(
-    '^Remove-Item\s+.*\$env:TEMP',
-    '^Remove-Item\s+.*\$env:LOCALAPPDATA\\Google\\Chrome',
-    '^Remove-Item\s+.*\$env:LOCALAPPDATA\\Microsoft\\Edge',
-    '^Remove-Item\s+.*Explorer\\thumbcache',
-    '^Clear-RecycleBin',
-    '^Clear-DnsClientCache',
-    '^Stop-Process\s+-Name'
-  )
-  foreach ($a in $allow) { if ($c -match $a) { return $true } }
-  return $false
-}
-
 Write-Host "🔍 Scanning..."
 
 # ══════════════════════════════════════════
-# 0. HARDWARE / OEM IDENTITY  (NEW v4 — drives vendor-aware advice)
+# 0. HARDWARE / OEM IDENTITY
 # ══════════════════════════════════════════
 $cs       = Get-CimInstance Win32_ComputerSystem
 $biosInfo = Get-CimInstance Win32_BIOS
@@ -114,7 +79,7 @@ try {
 $recycleBinGb   = Get-FolderSizeGB "$env:SystemDrive\`$Recycle.Bin"
 $tempGb         = Get-FolderSizeGB $env:TEMP
 $winTempGb      = Get-FolderSizeGB "$env:WINDIR\Temp"
-$winUpdateGb    = Get-FolderSizeGB "$env:WINDIR\SoftwareDistribution\Download"   # NEW v4
+$winUpdateGb    = Get-FolderSizeGB "$env:WINDIR\SoftwareDistribution\Download"
 $downloadsPath  = Join-Path $env:USERPROFILE 'Downloads'
 $downloadsGb    = Get-FolderSizeGB $downloadsPath
 $downloadsCount = (Get-ChildItem -Path $downloadsPath -File -ErrorAction SilentlyContinue).Count
@@ -256,7 +221,7 @@ try {
 } catch {}
 
 $defenderEnabled = $false
-$defenderDefAgeDays = 0   # NEW v4
+$defenderDefAgeDays = 0
 try {
   $def = Get-MpComputerStatus -ErrorAction SilentlyContinue
   if ($def -and $def.RealTimeProtectionEnabled) { $defenderEnabled = $true }
@@ -271,7 +236,6 @@ try {
   $pendingUpdates = $result.Updates.Count
 } catch {}
 
-# NEW v4 — pending reboot (real reason updates keep failing / perf degrades)
 $pendingReboot = $false
 try {
   if ((Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") -or
@@ -335,7 +299,7 @@ try {
 } catch {}
 
 # ══════════════════════════════════════════
-# POST SCAN DATA TO AI
+# POST SCAN DATA TO AI  (unchanged contract)
 # ══════════════════════════════════════════
 Write-Host "📤 Submitting scan to AI..."
 
@@ -444,142 +408,110 @@ try {
 Write-Host "✅ Scan submitted. Waiting for approval on portal..."
 
 # ══════════════════════════════════════════
-# POLL FOR APPROVAL
+# POLL FOR APPROVAL + FETCH APPROVED ACTIONS
+# The agent uses ONLY the agt_ SessionToken. /approved-actions returns:
+#   409 → not yet approved (keep waiting)
+#   200 → approved; body has the action list
+#   401 → session ended/expired (stop)
 # ══════════════════════════════════════════
-$maxWait = 600  # 10 minutes
+function Get-StatusCode($err) {
+  try {
+    if ($err.Exception.Response -and $err.Exception.Response.StatusCode) {
+      return [int]$err.Exception.Response.StatusCode
+    }
+  } catch {}
+  return 0
+}
+
+$approvedUrl = "$ApiBase/api/agent/session/$SessionToken/approved-actions"
+$maxWait = 600
 $pollInterval = 5
 $waited = 0
-$sessionResponse = $null
+$actions = $null
 
 while ($waited -lt $maxWait) {
   try {
-    $sessionResponse = Invoke-RestMethod -Uri "$ApiBase/api/agent/session/$SessionId" `
-      -Method Get `
-      -Headers @{ Authorization = "Bearer $AuthToken" } `
-      -TimeoutSec 15
+    $resp = Invoke-RestMethod -Uri $approvedUrl -Method Get -TimeoutSec 15
+    Write-Host "🔧 Fixes approved! Executing..."
+    $actions = @($resp.actions)
+    break
   } catch {
-    Start-Sleep -Seconds $pollInterval
-    $waited += $pollInterval
-    continue
-  }
-
-  $status = $sessionResponse.session.status
-
-  switch ($status) {
-    "fixing" {
-      Write-Host "🔧 Fixes approved! Executing..."
-      break
-    }
-    "completed" {
-      Write-Host "✅ Session completed."
+    $code = Get-StatusCode $_
+    if ($code -eq 401) {
+      Write-Host "ℹ️  Session is no longer active. Exiting."
       Cleanup-And-Exit 0
     }
-    { $_ -in @("cancelled", "failed") } {
-      Write-Host "❌ Session $_."
-      Cleanup-And-Exit 0
-    }
-    default { }
+    # 409 (awaiting approval) or transient error → keep polling
   }
-
-  if ($status -eq "fixing") { break }
-
   Start-Sleep -Seconds $pollInterval
   $waited += $pollInterval
 }
 
-if ($waited -ge $maxWait) {
+if ($null -eq $actions) {
   Write-Host "⏰ Timed out waiting for approval."
   Cleanup-And-Exit 1
 }
-
-# ══════════════════════════════════════════
-# EXECUTE APPROVED FIXES
-# ══════════════════════════════════════════
-$fixesApproved = $sessionResponse.session.fixes_approved
-
-if (-not $fixesApproved -or $fixesApproved.Count -eq 0) {
-  Write-Host "⚠️  No fixes to execute."
+if (@($actions).Count -eq 0) {
+  Write-Host "⚠️  No actions to execute."
   Cleanup-And-Exit 0
 }
 
-$fixCount = $fixesApproved.Count
-Write-Host "🔧 Executing $fixCount fixes..."
-
-foreach ($fix in $fixesApproved) {
-  $fixTitle = $fix.title
-  $fixCmd   = $fix.fix.command
-
-  if (-not $fixCmd -or $fixCmd -eq "null") {
-    Write-Host "  ⏭️  Skipping '$fixTitle' — no command"
-    try {
-      $skipBody = @{
-        session_token = $SessionToken
-        fix_id        = $fixTitle
-        result        = "failed"
-        error_details = "No executable command provided"
-      } | ConvertTo-Json -Compress
-      $null = Invoke-RestMethod -Uri "$ApiBase/api/agent/fix-result" `
-        -Method Post -ContentType 'application/json' `
-        -Headers @{ Authorization = "Bearer $AuthToken" } `
-        -Body $skipBody -TimeoutSec 10
-    } catch {}
-    continue
-  }
-
-  # NEW v4 — refuse anything outside the safe allowlist BEFORE executing
-  if (-not (Test-SafeCommand $fixCmd)) {
-    Write-Host "  🚫 Blocked by safety allowlist: $fixTitle"
-    try {
-      $blockBody = @{
-        session_token = $SessionToken
-        fix_id        = $fixTitle
-        result        = "failed"
-        error_details = "Blocked by client safety allowlist"
-      } | ConvertTo-Json -Compress
-      $null = Invoke-RestMethod -Uri "$ApiBase/api/agent/fix-result" `
-        -Method Post -ContentType 'application/json' `
-        -Headers @{ Authorization = "Bearer $AuthToken" } `
-        -Body $blockBody -TimeoutSec 10
-    } catch {}
-    continue
-  }
-
-  Write-Host "  🔧 Fixing: $fixTitle"
-
-  $fixResult = "success"
-  $fixError  = ""
+# ══════════════════════════════════════════
+# EXECUTE APPROVED ACTIONS
+# Structured {action_id, params} → fixed cmdlet calls. NO Invoke-Expression.
+# NO server command strings. An action_id the switch does not know is refused.
+# ══════════════════════════════════════════
+function Report-Result([string]$ActionId, [string]$Result, [string]$ErrText) {
   try {
-    $output = Invoke-Expression $fixCmd 2>&1 | Out-String
-    if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
-      $fixResult = "failed"
-      $fixError  = $output.Substring(0, [Math]::Min(500, $output.Length))
-    }
-  } catch {
-    $fixResult = "failed"
-    $fixError  = $_.Exception.Message.Substring(0, [Math]::Min(500, $_.Exception.Message.Length))
-  }
-
-  if ($fixResult -eq "success") {
-    Write-Host "  ✅ Fixed: $fixTitle"
-  } else {
-    Write-Host "  ❌ Failed: $fixTitle"
-  }
-
-  try {
-    $resultBody = @{
+    $body = @{
       session_token = $SessionToken
-      fix_id        = $fixTitle
-      result        = $fixResult
-      error_details = $fixError
+      fix_id        = $ActionId
+      result        = $Result
+      error_details = $ErrText
     } | ConvertTo-Json -Compress
     $null = Invoke-RestMethod -Uri "$ApiBase/api/agent/fix-result" `
       -Method Post -ContentType 'application/json' `
-      -Headers @{ Authorization = "Bearer $AuthToken" } `
-      -Body $resultBody -TimeoutSec 10
+      -Body $body -TimeoutSec 10
   } catch {}
+}
 
+function Invoke-AgentAction([string]$Id, $Params) {
+  switch ($Id) {
+    'flush_dns'         { Clear-DnsClientCache; return $true }
+    'clear_temp'        { Remove-Item -Path (Join-Path $env:TEMP '*') -Recurse -Force -ErrorAction SilentlyContinue; return $true }
+    'empty_recycle_bin' { Clear-RecycleBin -Force -ErrorAction SilentlyContinue; return $true }
+    'clear_cache' {
+      switch ($Params.target) {
+        'chrome' { Remove-Item -Path (Join-Path $env:LOCALAPPDATA 'Google\Chrome\User Data\Default\Cache\*') -Recurse -Force -ErrorAction SilentlyContinue; return $true }
+        'edge'   { Remove-Item -Path (Join-Path $env:LOCALAPPDATA 'Microsoft\Edge\User Data\Default\Cache\*')   -Recurse -Force -ErrorAction SilentlyContinue; return $true }
+        default  { return $false }   # unknown target -> refuse
+      }
+    }
+    default { return $false }   # unknown / disabled / wrong-OS action -> refuse
+  }
+}
+
+$count = @($actions).Count
+Write-Host "🔧 Executing $count approved action(s)..."
+
+foreach ($a in @($actions)) {
+  $id    = $a.action_id
+  $title = if ($a.title) { $a.title } else { $id }
+  if (-not $id) { continue }
+
+  Write-Host "  🔧 $title"
+  $ok = $false
+  try { $ok = Invoke-AgentAction $id $a.params } catch { $ok = $false }
+
+  if ($ok) {
+    Write-Host "  ✅ Done: $title"
+    Report-Result $id "success" ""
+  } else {
+    Write-Host "  🚫 Refused: $title (not a permitted action on this machine)"
+    Report-Result $id "failed" "Action not permitted by agent dispatch"
+  }
   Start-Sleep -Seconds 1
 }
 
-Write-Host "✅ All fixes complete!"
+Write-Host "✅ All actions complete!"
 Cleanup-And-Exit 0
