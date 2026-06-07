@@ -1,30 +1,28 @@
 #!/bin/bash
-# HelpIT Autonomous Agent — macOS Comprehensive Scan + Fix (v4.0)
-# Built on v3.1 — IDENTICAL backend contract (endpoints, payload shapes, auth, polling,
-# fix-result). New in v4: hardware identity (Intel vs Apple Silicon), storage root-cause
-# depth (local snapshots + SMART), battery condition/cycles, and a client-side safety
-# allowlist that blocks any non-approved command shape before execution.
+# HelpIT Autonomous Agent — macOS Scan + Fix (v5.0)
+# v5 security rewrite: the agent NEVER executes a command string from the server.
+#   - Auth: every fix-phase call uses ONLY the short-lived agt_ SESSION_TOKEN.
+#   - Approval: polls /approved-actions, which returns nothing until the customer
+#     approves in the portal (the human gate, enforced server-side).
+#   - Execution: approved {action_id, params} are mapped to fixed native
+#     functions via a dispatch table. No eval. No allowlist-on-strings.
+# The SCAN section (0-8 + scan POST) is UNCHANGED from v4.
 
 set -u
 
+# AUTH_TOKEN is intentionally blanked by the server now (token hygiene). The
+# agent authenticates every call with the agt_ SESSION_TOKEN only. The line is
+# kept so the scan POST below still references a defined variable under `set -u`.
 AUTH_TOKEN="{{AUTH_TOKEN}}"
 SESSION_TOKEN="{{SESSION_TOKEN}}"
 SESSION_ID="{{SESSION_ID}}"
 API_BASE="https://www.helpitinc.com"
-SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 
-# Minimize Terminal
-osascript -e 'tell application "System Events" to set visible of process "Terminal" to false' >/dev/null 2>&1 &
-
-# Open portal session page in default browser
+# Open portal session page in default browser so the customer can review & approve
 open "$API_BASE/helpit-agent/session/$SESSION_ID"
 
 cleanup_and_exit() {
   local code="${1:-0}"
-  if [ -n "$SCRIPT_PATH" ] && [ -f "$SCRIPT_PATH" ]; then
-    rm -f "$SCRIPT_PATH" >/dev/null 2>&1 || true
-  fi
-  osascript -e 'tell application "Terminal" to quit' >/dev/null 2>&1 &
   exit "$code"
 }
 trap 'cleanup_and_exit 1' INT TERM
@@ -38,29 +36,10 @@ safe_du_gb() {
   else echo "0"; fi
 }
 
-# ── NEW (v4): client-side safety allowlist ──────────────────────────────────
-# Defense-in-depth. Even if the server returns a command, we refuse to run it
-# unless it matches a known-safe shape AND contains no elevation/destructive tokens.
-# The agent NEVER runs sudo or anything outside this set.
-is_safe_command() {
-  local c="$1"
-  case "$c" in
-    *sudo*|*"rm -rf /"*|*mkfs*|*"diskutil erase"*|*shutdown*|*reboot*|*"dd if="*|*":(){"*) return 1;;
-  esac
-  case "$c" in
-    "rm -rf ~/Library/Caches/"*)            return 0;;  # covers Chrome/Safari cache too
-    "rm -rf \$TMPDIR"*|'rm -rf "$TMPDIR"'*) return 0;;
-    "dscacheutil -flushcache"*)             return 0;;
-    "pkill -f "*)                           return 0;;
-    osascript*"empty trash"*)               return 0;;
-  esac
-  return 1
-}
-
 echo "🔍 Scanning..."
 
 # ══════════════════════════════════════════
-# 0. HARDWARE IDENTITY  (NEW v4 — drives hardware-aware fixes)
+# 0. HARDWARE IDENTITY
 # ══════════════════════════════════════════
 ARCH=$(uname -m)
 IS_INTEL=false; [ "$ARCH" = "x86_64" ] && IS_INTEL=true
@@ -98,7 +77,6 @@ DOWNLOADS_GB=$(safe_du_gb "$HOME/Downloads")
 DOWNLOADS_COUNT=$(find "$HOME/Downloads" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')
 DS_STORE_COUNT=$(find "$HOME" -name ".DS_Store" -type f 2>/dev/null | wc -l | tr -d ' ')
 
-# NEW v4 — storage root-cause signals
 LOCAL_SNAPSHOTS=$(tmutil listlocalsnapshots / 2>/dev/null | grep -c 'com.apple'); [ -z "$LOCAL_SNAPSHOTS" ] && LOCAL_SNAPSHOTS=0
 SMART_STATUS=$(diskutil info disk0 2>/dev/null | awk -F': ' '/SMART Status/{gsub(/^ +/,"",$2); print $2; exit}'); [ -z "$SMART_STATUS" ] && SMART_STATUS="Not Supported"
 
@@ -230,7 +208,6 @@ if echo "$BATT_RAW" | grep -q "Battery Information"; then
   MAX_CAP=$(echo "$BATT_RAW" | awk '/Maximum Capacity/ {gsub(/%/,"",$3); print $3; exit}')
   [ -n "$MAX_CAP" ] && BATTERY_HEALTH="$MAX_CAP"
 fi
-# NEW v4 — battery condition + cycle count (manufacturer service guidance)
 BATTERY_CONDITION=$(echo "$BATT_RAW" | awk -F': ' '/Condition/{gsub(/^ +/,"",$2); print $2; exit}'); [ -z "$BATTERY_CONDITION" ] && BATTERY_CONDITION="Unknown"
 BATTERY_CYCLES=$(echo "$BATT_RAW" | awk -F': ' '/Cycle Count/{gsub(/^ +/,"",$2); print $2; exit}'); [ -z "$BATTERY_CYCLES" ] && BATTERY_CYCLES=0
 CRASH_REPORTS_COUNT=$(ls "$HOME/Library/Logs/DiagnosticReports" 2>/dev/null | wc -l | tr -d ' ')
@@ -240,7 +217,7 @@ CONSOLE_ERRORS_JSON=$(log show --last 1h --predicate 'messageType == error' --st
 [ -z "$CONSOLE_ERRORS_JSON" ] && CONSOLE_ERRORS_JSON="[]"
 
 # ══════════════════════════════════════════
-# POST SCAN DATA TO AI
+# POST SCAN DATA TO AI  (unchanged contract)
 # ══════════════════════════════════════════
 echo "📤 Submitting scan to AI..."
 SCAN_PAYLOAD=$(cat <<JSON
@@ -313,108 +290,111 @@ fi
 echo "✅ Scan submitted. Waiting for approval on portal..."
 
 # ══════════════════════════════════════════
-# POLL FOR APPROVAL
+# POLL FOR APPROVAL + FETCH APPROVED ACTIONS
+# The agent uses ONLY the agt_ SESSION_TOKEN. /approved-actions returns:
+#   409 → not yet approved (keep waiting)
+#   200 → approved; body has the action list
+#   401 → session ended/expired (stop)
 # ══════════════════════════════════════════
+APPROVED_URL="$API_BASE/api/agent/session/$SESSION_TOKEN/approved-actions"
 MAX_WAIT=600
 POLL_INTERVAL=5
 WAITED=0
+ACTIONS_JSON=""
 
 while [ "$WAITED" -lt "$MAX_WAIT" ]; do
-  SESSION_RESPONSE=$(curl -sS -X GET "$API_BASE/api/agent/session/$SESSION_ID" \
-    -H "Authorization: Bearer $AUTH_TOKEN" \
-    --max-time 15 2>/dev/null)
+  RESP=$(curl -sS -w $'\n%{http_code}' -X GET "$APPROVED_URL" --max-time 15 2>/dev/null)
+  CODE=$(printf '%s' "$RESP" | tail -1)
+  BODY=$(printf '%s' "$RESP" | sed '$d')
 
-  STATUS=$(echo "$SESSION_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('session',{}).get('status',''))" 2>/dev/null)
-
-  case "$STATUS" in
-    fixing)
+  case "$CODE" in
+    200)
       echo "🔧 Fixes approved! Executing..."
+      ACTIONS_JSON=$(printf '%s' "$BODY" | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin).get('actions',[])))" 2>/dev/null)
       break
       ;;
-    completed)
-      echo "✅ Session completed."
+    409)
+      : # still awaiting customer approval — keep polling
+      ;;
+    401)
+      echo "ℹ️  Session is no longer active. Exiting."
       cleanup_and_exit 0
       ;;
-    cancelled|failed)
-      echo "❌ Session $STATUS."
-      cleanup_and_exit 0
+    *)
+      : # transient/network error — keep polling
       ;;
-    awaiting_approval) ;;
-    *) ;;
   esac
 
   sleep "$POLL_INTERVAL"
   WAITED=$((WAITED + POLL_INTERVAL))
 done
 
-if [ "$WAITED" -ge "$MAX_WAIT" ]; then
+if [ -z "$ACTIONS_JSON" ]; then
   echo "⏰ Timed out waiting for approval."
   cleanup_and_exit 1
 fi
-
-# ══════════════════════════════════════════
-# EXECUTE APPROVED FIXES
-# ══════════════════════════════════════════
-FIXES_JSON=$(echo "$SESSION_RESPONSE" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-fixes = d.get('session', {}).get('fixes_approved', [])
-print(json.dumps(fixes))
-" 2>/dev/null)
-
-if [ -z "$FIXES_JSON" ] || [ "$FIXES_JSON" = "[]" ] || [ "$FIXES_JSON" = "null" ]; then
-  echo "⚠️  No fixes to execute."
+if [ "$ACTIONS_JSON" = "[]" ] || [ "$ACTIONS_JSON" = "null" ]; then
+  echo "⚠️  No actions to execute."
   cleanup_and_exit 0
 fi
 
-FIX_COUNT=$(echo "$FIXES_JSON" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null)
-echo "🔧 Executing $FIX_COUNT fixes..."
-
-for i in $(seq 0 $((FIX_COUNT - 1))); do
-  FIX_TITLE=$(echo "$FIXES_JSON" | python3 -c "import sys,json; f=json.load(sys.stdin)[$i]; print(f.get('title',''))" 2>/dev/null)
-  FIX_CMD=$(echo "$FIXES_JSON" | python3 -c "import sys,json; f=json.load(sys.stdin)[$i]; print(f.get('fix',{}).get('command',''))" 2>/dev/null)
-
-  if [ -z "$FIX_CMD" ] || [ "$FIX_CMD" = "None" ] || [ "$FIX_CMD" = "null" ]; then
-    echo "  ⏭️  Skipping '$FIX_TITLE' — no command"
-    curl -sS -X POST "$API_BASE/api/agent/fix-result" \
-      -H "Content-Type: application/json" \
-      -H "Authorization: Bearer $AUTH_TOKEN" \
-      --max-time 10 \
-      --data "{\"session_token\":\"$SESSION_TOKEN\",\"fix_id\":\"$FIX_TITLE\",\"result\":\"failed\",\"error_details\":\"No executable command provided\"}" >/dev/null 2>&1
-    continue
-  fi
-
-  # NEW v4 — refuse anything outside the safe allowlist BEFORE executing
-  if ! is_safe_command "$FIX_CMD"; then
-    echo "  🚫 Blocked by safety allowlist: $FIX_TITLE"
-    curl -sS -X POST "$API_BASE/api/agent/fix-result" \
-      -H "Content-Type: application/json" \
-      -H "Authorization: Bearer $AUTH_TOKEN" \
-      --max-time 10 \
-      --data "{\"session_token\":\"$SESSION_TOKEN\",\"fix_id\":\"$FIX_TITLE\",\"result\":\"failed\",\"error_details\":\"Blocked by client safety allowlist\"}" >/dev/null 2>&1
-    continue
-  fi
-
-  echo "  🔧 Fixing: $FIX_TITLE"
-  FIX_OUTPUT=$(eval "$FIX_CMD" 2>&1)
-  FIX_EXIT=$?
-
-  if [ "$FIX_EXIT" -eq 0 ]; then
-    FIX_RESULT="success"; echo "  ✅ Fixed: $FIX_TITLE"
-  else
-    FIX_RESULT="failed";  echo "  ❌ Failed: $FIX_TITLE"
-  fi
-
-  ESCAPED_OUTPUT=$(echo "$FIX_OUTPUT" | head -c 500 | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))' 2>/dev/null || echo '""')
-
+# ══════════════════════════════════════════
+# EXECUTE APPROVED ACTIONS
+# Structured {action_id, params} → fixed native functions. NO eval. NO server
+# command strings. An action_id the dispatch table does not know is refused.
+# ══════════════════════════════════════════
+report_result() {   # $1 action_id, $2 result, $3 error text
+  local err_json
+  err_json=$(printf '%s' "$3" | head -c 400 | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))' 2>/dev/null || echo '""')
   curl -sS -X POST "$API_BASE/api/agent/fix-result" \
     -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $AUTH_TOKEN" \
     --max-time 10 \
-    --data "{\"session_token\":\"$SESSION_TOKEN\",\"fix_id\":\"$FIX_TITLE\",\"result\":\"$FIX_RESULT\",\"error_details\":$ESCAPED_OUTPUT}" >/dev/null 2>&1
+    --data "{\"session_token\":\"$SESSION_TOKEN\",\"fix_id\":\"$1\",\"result\":\"$2\",\"error_details\":$err_json}" >/dev/null 2>&1
+}
 
+do_flush_dns()   { dscacheutil -flushcache; killall -HUP mDNSResponder 2>/dev/null; return 0; }
+do_clear_temp()  { [ -n "${TMPDIR:-}" ] && rm -rf "${TMPDIR:?}/"* 2>/dev/null; return 0; }
+do_empty_trash() { rm -rf "$HOME/.Trash/"* 2>/dev/null; return 0; }
+do_clear_cache() {   # $1 = target (fixed branches only; never interpolated into a command)
+  case "$1" in
+    chrome) rm -rf "$HOME/Library/Caches/Google/Chrome/"* 2>/dev/null;;
+    safari) rm -rf "$HOME/Library/Caches/com.apple.Safari/"* 2>/dev/null;;
+    edge)   rm -rf "$HOME/Library/Caches/Microsoft Edge/"* 2>/dev/null;;
+    *)      return 2;;
+  esac
+  return 0
+}
+
+dispatch_action() {   # $1 = action_id, $2 = target param
+  case "$1" in
+    flush_dns)   do_flush_dns;;
+    clear_temp)  do_clear_temp;;
+    empty_trash) do_empty_trash;;
+    clear_cache) do_clear_cache "$2";;
+    *)           return 3;;   # unknown / disabled / wrong-OS action -> refuse
+  esac
+}
+
+COUNT=$(printf '%s' "$ACTIONS_JSON" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null)
+echo "🔧 Executing $COUNT approved action(s)..."
+
+for i in $(seq 0 $((COUNT - 1))); do
+  ACTION_ID=$(printf '%s' "$ACTIONS_JSON" | python3 -c "import sys,json; a=json.load(sys.stdin)[$i]; print(a.get('action_id',''))" 2>/dev/null)
+  TITLE=$(printf '%s' "$ACTIONS_JSON"     | python3 -c "import sys,json; a=json.load(sys.stdin)[$i]; print(a.get('title') or a.get('action_id',''))" 2>/dev/null)
+  TARGET=$(printf '%s' "$ACTIONS_JSON"    | python3 -c "import sys,json; a=json.load(sys.stdin)[$i]; p=a.get('params') or {}; print(p.get('target',''))" 2>/dev/null)
+
+  [ -z "$ACTION_ID" ] && continue
+
+  echo "  🔧 $TITLE"
+  if dispatch_action "$ACTION_ID" "$TARGET"; then
+    echo "  ✅ Done: $TITLE"
+    report_result "$ACTION_ID" "success" ""
+  else
+    echo "  🚫 Refused: $TITLE (not a permitted action on this machine)"
+    report_result "$ACTION_ID" "failed" "Action not permitted by agent dispatch"
+  fi
   sleep 1
 done
 
-echo "✅ All fixes complete!"
+echo "✅ All actions complete!"
 cleanup_and_exit 0
