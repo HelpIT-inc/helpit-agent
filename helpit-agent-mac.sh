@@ -1,13 +1,14 @@
 #!/bin/bash
-# HelpIT Autonomous Agent — macOS Scan + Fix (v5.1)
+# HelpIT Autonomous Agent — macOS Scan + Fix (v5.2)
 # v5 security rewrite: the agent NEVER executes a command string from the server.
 #   - Auth: every fix-phase call uses ONLY the short-lived agt_ SESSION_TOKEN.
 #   - Approval: polls /approved-actions, which returns nothing until the customer
 #     approves in the portal (the human gate, enforced server-side).
 #   - Execution: approved {action_id, params} are mapped to fixed native
 #     functions via a dispatch table. No eval. No allowlist-on-strings.
-# The SCAN section is UNCHANGED from v5.0 EXCEPT Trash measurement, which now
-# reads through Finder and fails LOUD (-1 = blocked) instead of silently 0.
+# v5.1: Trash MEASUREMENT reads through Finder, fails LOUD (-1=blocked) not 0.
+# v5.2: Trash EMPTY uses Finder and VERIFIES by re-count -- reports success
+#       only if the Trash is actually empty, never on a silent no-op.
 
 set -u
 
@@ -379,7 +380,18 @@ report_result() {   # $1 action_id, $2 result, $3 error text
 
 do_flush_dns()   { dscacheutil -flushcache; killall -HUP mDNSResponder 2>/dev/null; return 0; }
 do_clear_temp()  { [ -n "${TMPDIR:-}" ] && rm -rf "${TMPDIR:?}/"* 2>/dev/null; return 0; }
-do_empty_trash() { rm -rf "$HOME/.Trash/"* 2>/dev/null; return 0; }
+do_empty_trash() {
+  # rm on ~/.Trash is blocked by macOS App Management and silently exits 0 --
+  # it reported "success" while deleting nothing. Use Finder (which holds the
+  # entitlement) and VERIFY by re-counting. Never trust the exit code here.
+  local before after
+  before=$(osascript -e 'tell application "Finder" to count items of trash' 2>/dev/null)
+  osascript -e 'tell application "Finder" to empty trash' 2>/dev/null
+  after=$(osascript -e 'tell application "Finder" to count items of trash' 2>/dev/null)
+  [ -z "$after" ] && return 1          # couldn't verify -> honest failure
+  [ "$after" = "0" ] && return 0       # Trash actually empty now -> success
+  return 1                              # items remain -> honest failure
+}
 do_clear_cache() {   # $1 = target (fixed branches only; never interpolated into a command)
   case "$1" in
     chrome) rm -rf "$HOME/Library/Caches/Google/Chrome/"* 2>/dev/null;;
