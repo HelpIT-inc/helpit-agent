@@ -1,12 +1,13 @@
 #!/bin/bash
-# HelpIT Autonomous Agent — macOS Scan + Fix (v5.0)
+# HelpIT Autonomous Agent — macOS Scan + Fix (v5.1)
 # v5 security rewrite: the agent NEVER executes a command string from the server.
 #   - Auth: every fix-phase call uses ONLY the short-lived agt_ SESSION_TOKEN.
 #   - Approval: polls /approved-actions, which returns nothing until the customer
 #     approves in the portal (the human gate, enforced server-side).
 #   - Execution: approved {action_id, params} are mapped to fixed native
 #     functions via a dispatch table. No eval. No allowlist-on-strings.
-# The SCAN section (0-8 + scan POST) is UNCHANGED from v4.
+# The SCAN section is UNCHANGED from v5.0 EXCEPT Trash measurement, which now
+# reads through Finder and fails LOUD (-1 = blocked) instead of silently 0.
 
 set -u
 
@@ -34,6 +35,30 @@ safe_du_gb() {
     local kb; kb=$(du -sk "$1" 2>/dev/null | awk '{print $1}'); [ -z "$kb" ] && kb=0
     kb_to_gb "$kb"
   else echo "0"; fi
+}
+
+# Trash size via Finder automation (reads THROUGH macOS privacy protection).
+# `du ~/.Trash` returns "Operation not permitted" under macOS TCC, and that
+# failure silently became 0 GB -- the agent reported a clean machine it never
+# actually inspected. This reads the real size through Finder (which holds the
+# entitlement) and returns -1 ("blocked / unknown") when it genuinely cannot
+# read -- NEVER a fake 0. Finder returns per-item physical size in bytes,
+# sometimes in scientific notation (e.g. 7.1077888E+8), so the sum is done in
+# awk, which handles it; bash arithmetic cannot.
+trash_size_gb() {
+  local sizes
+  sizes=$(osascript -e 'tell application "Finder" to get physical size of every item of trash' 2>/dev/null)
+  if [ -z "$sizes" ]; then
+    # Empty output is ambiguous: truly-empty Trash vs. blocked. Ask Finder for a
+    # count to tell them apart. count "0" => real empty; otherwise => blocked.
+    local count
+    count=$(osascript -e 'tell application "Finder" to count items of trash' 2>/dev/null)
+    if [ "$count" = "0" ]; then echo "0"; else echo "-1"; fi
+    return
+  fi
+  echo "$sizes" | awk -F',' '
+    { for (i=1; i<=NF; i++) { gsub(/[^0-9eE.+-]/,"",$i); if ($i!="") sum += $i } }
+    END { printf "%.2f", sum/1024/1024/1024 }'
 }
 
 echo "🔍 Scanning..."
@@ -69,7 +94,7 @@ if [ -n "$TOP" ]; then
     END { printf "]" }')
 fi
 
-TRASH_GB=$(safe_du_gb "$HOME/.Trash")
+TRASH_GB=$(trash_size_gb)
 IOS_BACKUPS_GB=$(safe_du_gb "$HOME/Library/Application Support/MobileSync")
 TMP_GB=$(safe_du_gb "/tmp")
 VAR_FOLDERS_GB=$(safe_du_gb "/var/folders")
