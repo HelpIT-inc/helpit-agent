@@ -1,5 +1,5 @@
 #!/bin/bash
-# HelpIT Autonomous Agent — macOS Scan + Fix (v5.3)
+# HelpIT Autonomous Agent — macOS Scan + Fix (v5.4)
 # v5 security rewrite: the agent NEVER executes a command string from the server.
 #   - Auth: every fix-phase call uses ONLY the short-lived agt_ SESSION_TOKEN.
 #   - Approval: polls /approved-actions, which returns nothing until the customer
@@ -12,6 +12,10 @@
 # v5.3: Safari is DETECT-ONLY (sandbox blocks measure+clear). Scan emits
 #       safari_detected/last_used for the backend guided-fix card; the
 #       clear_cache safari branch now REFUSES instead of silently no-op-ing.
+# v5.4: flush_dns + clear_temp no longer return 0 blindly. flush_dns reports
+#       success on the dscacheutil flush (the mDNSResponder reload needs root
+#       and is best-effort); clear_temp verifies the file count actually
+#       dropped. No more silent-success on these two live actions.
 
 set -u
 
@@ -399,8 +403,33 @@ report_result() {   # $1 action_id, $2 result, $3 error text
     --data "{\"session_token\":\"$SESSION_TOKEN\",\"fix_id\":\"$1\",\"result\":\"$2\",\"error_details\":$err_json}" >/dev/null 2>&1
 }
 
-do_flush_dns()   { dscacheutil -flushcache; killall -HUP mDNSResponder 2>/dev/null; return 0; }
-do_clear_temp()  { [ -n "${TMPDIR:-}" ] && rm -rf "${TMPDIR:?}/"* 2>/dev/null; return 0; }
+do_flush_dns() {
+  # dscacheutil flush works as a normal user; the mDNSResponder reload needs root
+  # and fails for the agent's user ("No matching processes belonging to you") --
+  # that's EXPECTED, not a failure of the flush itself. The old code ran both and
+  # returned 0 unconditionally, so a failed flush would still report success.
+  # Report success based on the flush that actually runs; responder reload is
+  # best-effort.
+  if dscacheutil -flushcache 2>/dev/null; then
+    killall -HUP mDNSResponder 2>/dev/null   # best-effort; user can't signal a root-owned proc
+    return 0                                  # cache flushed -> honest success
+  fi
+  return 1                                    # the flush itself failed -> honest failure
+}
+do_clear_temp() {
+  # TMPDIR is user-owned and deletable, but it repopulates constantly and some
+  # files are locked-open by running apps (and must NOT be force-removed). So
+  # success = "we cleared what we could," not "it's empty" -- the old code blindly
+  # returned 0. Verify the count actually dropped (or there was nothing to clear).
+  [ -z "${TMPDIR:-}" ] && return 1
+  local before after
+  before=$(ls -1 "$TMPDIR" 2>/dev/null | wc -l | tr -d ' ')
+  rm -rf "${TMPDIR:?}/"* 2>/dev/null
+  after=$(ls -1 "$TMPDIR" 2>/dev/null | wc -l | tr -d ' ')
+  [ "$before" = "0" ] && return 0          # nothing to clear -> fine
+  [ "$after" -lt "$before" ] && return 0   # removed what we could -> honest success
+  return 1                                  # had files, none removed -> report honestly
+}
 do_empty_trash() {
   # rm on ~/.Trash is blocked by macOS App Management and silently exits 0 --
   # it reported "success" while deleting nothing. Use Finder (which holds the
