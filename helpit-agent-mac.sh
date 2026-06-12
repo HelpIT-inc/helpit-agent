@@ -1,5 +1,5 @@
 #!/bin/bash
-# HelpIT Autonomous Agent — macOS Scan + Fix (v5.4)
+# HelpIT Autonomous Agent — macOS Scan + Fix (v5.5)
 # v5 security rewrite: the agent NEVER executes a command string from the server.
 #   - Auth: every fix-phase call uses ONLY the short-lived agt_ SESSION_TOKEN.
 #   - Approval: polls /approved-actions, which returns nothing until the customer
@@ -16,6 +16,12 @@
 #       success on the dscacheutil flush (the mDNSResponder reload needs root
 #       and is best-effort); clear_temp verifies the file count actually
 #       dropped. No more silent-success on these two live actions.
+# v5.5: clear_cache (chrome/edge) now targets the REAL profile cache folders
+#       (Cache, Code Cache, Service Worker caches) instead of the empty
+#       ~/Library/Caches stub, and VERIFIES the total size dropped. GPU/shader
+#       caches are intentionally left alone (regenerate instantly).
+#       NOTE: chrome/edge clear_cache only RUNS if browser_cleanup capability
+#       is enabled server-side -- still locked pending heavy-Chrome validation.
 
 set -u
 
@@ -442,14 +448,56 @@ do_empty_trash() {
   [ "$after" = "0" ] && return 0       # Trash actually empty now -> success
   return 1                              # items remain -> honest failure
 }
+# Clear a browser's MEANINGFUL caches (the ones that hold real space), summing
+# size before and after and reporting success ONLY if the total dropped -- never
+# a blind return 0. The old chrome/edge branches targeted ~/Library/Caches/...,
+# which is an empty stub on modern Chrome/Edge (the real cache moved into the
+# profile under Application Support), so they cleared nothing and lied success.
+# We target the profile cache folders that actually consume space and skip the
+# GPU/shader caches (they regenerate instantly and free ~nothing). Some files are
+# locked-open while the browser runs -- success means "the total shrank," not
+# "it hit zero." NEVER interpolate $1 into a path; fixed branches only.
+_cache_dirs_kb() {   # sum KB across the dir list passed as "$@" (missing dirs = 0)
+  local total=0 d kb
+  for d in "$@"; do
+    [ -d "$d" ] || continue
+    kb=$(du -sk "$d" 2>/dev/null | awk '{print $1}'); [ -z "$kb" ] && kb=0
+    total=$((total + kb))
+  done
+  echo "$total"
+}
+_clear_cache_dirs() {   # measure -> clear contents -> measure; honest verdict
+  local before after d
+  before=$(_cache_dirs_kb "$@")
+  for d in "$@"; do
+    [ -d "$d" ] && rm -rf "$d/"* 2>/dev/null
+  done
+  after=$(_cache_dirs_kb "$@")
+  [ "$before" = "0" ] && return 0          # nothing meaningful to clear -> honest success
+  [ "$after" -lt "$before" ] && return 0   # total shrank -> honest success (locked files may remain)
+  return 1                                  # had cache, nothing freed -> report honestly
+}
 do_clear_cache() {   # $1 = target (fixed branches only; never interpolated into a command)
+  local chrome_base="$HOME/Library/Application Support/Google/Chrome/Default"
+  local edge_base="$HOME/Library/Application Support/Microsoft Edge/Default"
   case "$1" in
-    chrome) rm -rf "$HOME/Library/Caches/Google/Chrome/"* 2>/dev/null;;
+    chrome)
+      _clear_cache_dirs \
+        "$chrome_base/Cache" \
+        "$chrome_base/Code Cache" \
+        "$chrome_base/Service Worker/CacheStorage" \
+        "$chrome_base/Service Worker/ScriptCache"
+      ;;
     safari) return 2;;   # Safari is guided-fix only; the agent never clears it (macOS sandbox blocks it). Refuse honestly.
-    edge)   rm -rf "$HOME/Library/Caches/Microsoft Edge/"* 2>/dev/null;;
-    *)      return 2;;
+    edge)
+      _clear_cache_dirs \
+        "$edge_base/Cache" \
+        "$edge_base/Code Cache" \
+        "$edge_base/Service Worker/CacheStorage" \
+        "$edge_base/Service Worker/ScriptCache"
+      ;;
+    *) return 2;;
   esac
-  return 0
 }
 
 dispatch_action() {   # $1 = action_id, $2 = target param
