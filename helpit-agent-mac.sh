@@ -1,5 +1,5 @@
 #!/bin/bash
-# HelpIT Autonomous Agent — macOS Scan + Fix (v5.2)
+# HelpIT Autonomous Agent — macOS Scan + Fix (v5.3)
 # v5 security rewrite: the agent NEVER executes a command string from the server.
 #   - Auth: every fix-phase call uses ONLY the short-lived agt_ SESSION_TOKEN.
 #   - Approval: polls /approved-actions, which returns nothing until the customer
@@ -9,6 +9,9 @@
 # v5.1: Trash MEASUREMENT reads through Finder, fails LOUD (-1=blocked) not 0.
 # v5.2: Trash EMPTY uses Finder and VERIFIES by re-count -- reports success
 #       only if the Trash is actually empty, never on a silent no-op.
+# v5.3: Safari is DETECT-ONLY (sandbox blocks measure+clear). Scan emits
+#       safari_detected/last_used for the backend guided-fix card; the
+#       clear_cache safari branch now REFUSES instead of silently no-op-ing.
 
 set -u
 
@@ -217,7 +220,23 @@ systemsetup -getremotelogin 2>/dev/null | grep -qi "On" && REMOTE_LOGIN_ENABLED=
 CHROME_EXT_DIR="$HOME/Library/Application Support/Google/Chrome/Default/Extensions"
 CHROME_EXT_COUNT=$(ls "$CHROME_EXT_DIR" 2>/dev/null | wc -l | tr -d ' ')
 CHROME_CACHE_GB=$(safe_du_gb "$HOME/Library/Caches/Google/Chrome")
-SAFARI_CACHE_GB=$(safe_du_gb "$HOME/Library/Caches/com.apple.Safari")
+# Safari cache: DETECT ONLY — macOS sandbox blocks measuring and clearing it.
+# Modern Safari stores its cache inside its sandbox container:
+#   ~/Library/Containers/com.apple.Safari/Data/Library/Caches
+# `du`/`ls` INSIDE that dir return "Operation not permitted" (confirmed on real
+# hardware), so the agent can neither size nor clear it. But `ls -d`/`stat` on
+# the dir ITSELF read through the wall, so we honestly detect that it exists and
+# when it was last used. Raw signals only; the backend decides whether to
+# surface the Safari guided-fix card. The old `~/Library/Caches/com.apple.Safari`
+# path is stale on modern macOS and is intentionally NOT used.
+SAFARI_CONTAINER_CACHE="$HOME/Library/Containers/com.apple.Safari/Data/Library/Caches"
+SAFARI_DETECTED=false
+SAFARI_LAST_USED_EPOCH=0
+if [ -d "$SAFARI_CONTAINER_CACHE" ]; then
+  SAFARI_DETECTED=true
+  SAFARI_LAST_USED_EPOCH=$(stat -f "%m" "$SAFARI_CONTAINER_CACHE" 2>/dev/null)
+  [ -z "$SAFARI_LAST_USED_EPOCH" ] && SAFARI_LAST_USED_EPOCH=0
+fi
 BROWSER_HELPERS_JSON=$(ps -A -o comm 2>/dev/null \
   | grep -Ei 'helper|extension' | sort -u | head -10 \
   | awk 'BEGIN{printf "["} NF>0 {gsub(/"/,"\\\""); printf "%s\"%s\"", (NR>1?",":""), $0} END{printf "]"}')
@@ -289,7 +308,9 @@ SCAN_PAYLOAD=$(cat <<JSON
     },
     "browser": {
       "chrome_extension_count": $CHROME_EXT_COUNT, "chrome_cache_size_gb": $CHROME_CACHE_GB,
-      "safari_cache_size_gb": $SAFARI_CACHE_GB, "browser_helpers": $BROWSER_HELPERS_JSON
+      "safari_detected": $SAFARI_DETECTED, "safari_last_used_epoch": $SAFARI_LAST_USED_EPOCH,
+      "safari_can_measure": false, "safari_can_auto_clear": false,
+      "browser_helpers": $BROWSER_HELPERS_JSON
     },
     "system": {
       "os_version": "$OS_VERSION", "os_build": "$OS_BUILD",
@@ -395,7 +416,7 @@ do_empty_trash() {
 do_clear_cache() {   # $1 = target (fixed branches only; never interpolated into a command)
   case "$1" in
     chrome) rm -rf "$HOME/Library/Caches/Google/Chrome/"* 2>/dev/null;;
-    safari) rm -rf "$HOME/Library/Caches/com.apple.Safari/"* 2>/dev/null;;
+    safari) return 2;;   # Safari is guided-fix only; the agent never clears it (macOS sandbox blocks it). Refuse honestly.
     edge)   rm -rf "$HOME/Library/Caches/Microsoft Edge/"* 2>/dev/null;;
     *)      return 2;;
   esac
